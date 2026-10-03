@@ -148,6 +148,13 @@ function authenticate(req, res, next) {
     }
 }
 
+async function isAdminRequest(req) {
+    const userId = req.auth && req.auth.userId;
+    if (!userId) return false;
+    const result = await pool.query("SELECT username FROM users WHERE id = $1 LIMIT 1", [userId]);
+    return result.rows.length > 0 && String(result.rows[0].username || "").trim().toLowerCase() === "wcrazyness";
+}
+
 function optionalAuth(req, res, next) {
     const authorization = req.headers.authorization || "";
     const [scheme, token] = authorization.split(" ");
@@ -364,7 +371,7 @@ app.post("/api/levels/:id/play", async (req, res) => {
 app.post("/api/levels/:id/rate", authenticate, async (req, res) => {
     try {
         const stars = Math.max(1, Math.min(5, Math.floor(Number(req.body.stars) || 0)));
-        if (req.auth.username.toLowerCase() !== "wcrazyness") {
+        if (!(await isAdminRequest(req))) {
             return res.status(403).json({ success: false, message: "Only wCrazyNess can rate levels right now." });
         }
         const result = await pool.query(
@@ -380,7 +387,7 @@ app.post("/api/levels/:id/rate", authenticate, async (req, res) => {
 });
 
 app.get("/api/admin/check", authenticate, async (req, res) => {
-    res.json({ success: true, isAdmin: req.auth.username.toLowerCase() === "wcrazyness" });
+    res.json({ success: true, isAdmin: await isAdminRequest(req) });
 });
 
 app.get("/api/admin/levels", authenticate, async (req, res) => {
