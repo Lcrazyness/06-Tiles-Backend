@@ -391,13 +391,19 @@ app.get("/api/admin/check", authenticate, async (req, res) => {
 });
 
 app.get("/api/admin/levels", authenticate, async (req, res) => {
-    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
-    const result = await pool.query("SELECT * FROM levels ORDER BY created_at DESC LIMIT 200");
-    res.json({ success: true, levels: result.rows.map(publicLevel) });
+    try {
+        if (!(await isAdminRequest(req))) return res.status(403).json({ success: false, message: "Admin access required" });
+        const result = await pool.query("SELECT * FROM levels ORDER BY created_at DESC LIMIT 200");
+        res.json({ success: true, levels: result.rows.map(publicLevel) });
+    } catch (error) {
+        console.error("Admin levels error:", error);
+        res.status(500).json({ success: false, message: "Could not load admin levels" });
+    }
 });
 
 app.patch("/api/admin/levels/:id/feature", authenticate, async (req, res) => {
-    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
+    try {
+        if (!(await isAdminRequest(req))) return res.status(403).json({ success: false, message: "Admin access required" });
     const featured = !!req.body.featured;
     const result = await pool.query(
         "UPDATE levels SET featured = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
@@ -405,13 +411,22 @@ app.patch("/api/admin/levels/:id/feature", authenticate, async (req, res) => {
     );
     if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
     res.json({ success: true, level: publicLevel(result.rows[0]) });
+    } catch (error) {
+        console.error("Admin feature error:", error);
+        res.status(500).json({ success: false, message: "Could not update featured status" });
+    }
 });
 
 app.delete("/api/admin/levels/:id", authenticate, async (req, res) => {
-    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
-    const result = await pool.query("DELETE FROM levels WHERE id = $1 RETURNING id", [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
-    res.json({ success: true });
+    try {
+        if (!(await isAdminRequest(req))) return res.status(403).json({ success: false, message: "Admin access required" });
+        const result = await pool.query("DELETE FROM levels WHERE id = $1 RETURNING id", [req.params.id]);
+        if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+        res.json({ success: true });
+    } catch (error) {
+        console.error("Admin delete error:", error);
+        res.status(500).json({ success: false, message: "Could not delete level" });
+    }
 });
 
 app.delete("/api/levels/:id", authenticate, async (req, res) => {
