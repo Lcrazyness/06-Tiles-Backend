@@ -326,6 +326,47 @@ app.get("/api/auth/me", authenticate, async (req, res) => {
     }
 });
 
+
+app.post("/api/stats/game", authenticate, async (req, res) => {
+    try {
+        const completed = !!req.body.completed;
+        const score = Math.max(0, Math.floor(Number(req.body.score) || 0));
+        const notesHit = Math.max(0, Math.floor(Number(req.body.notesHit) || 0));
+
+        const result = await pool.query(
+            `UPDATE users
+             SET games_played = games_played + 1,
+                 games_completed = games_completed + $2,
+                 total_score = total_score + $3,
+                 best_score = GREATEST(best_score, $3),
+                 total_notes_hit = total_notes_hit + $4,
+                 updated_at = NOW()
+             WHERE id = $1
+             RETURNING id, username, email, created_at, games_played, games_completed,
+                       total_score, best_score, total_notes_hit, battle_wins, battle_losses`,
+            [req.auth.userId, completed ? 1 : 0, score, notesHit]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "Account not found"
+            });
+        }
+
+        res.json({
+            success: true,
+            user: publicUser(result.rows[0])
+        });
+    } catch (error) {
+        console.error("Game stats update error:", error);
+        res.status(500).json({
+            success: false,
+            message: "Could not update game statistics"
+        });
+    }
+});
+
 async function startServer() {
     try {
         await initializeDatabase();
