@@ -330,21 +330,22 @@ app.get("/api/auth/me", authenticate, async (req, res) => {
 app.post("/api/stats/game", authenticate, async (req, res) => {
     try {
         const completed = !!req.body.completed;
+        const started = !!req.body.started;
         const score = Math.max(0, Math.floor(Number(req.body.score) || 0));
         const notesHit = Math.max(0, Math.floor(Number(req.body.notesHit) || 0));
 
         const result = await pool.query(
             `UPDATE users
-             SET games_played = games_played + 1,
-                 games_completed = games_completed + $2,
-                 total_score = total_score + $3,
-                 best_score = GREATEST(best_score, $3),
-                 total_notes_hit = total_notes_hit + $4,
+             SET games_played = games_played + $2,
+                 games_completed = games_completed + $3,
+                 total_score = total_score + $4,
+                 best_score = GREATEST(best_score, $4),
+                 total_notes_hit = total_notes_hit + $5,
                  updated_at = NOW()
              WHERE id = $1
              RETURNING id, username, email, created_at, games_played, games_completed,
                        total_score, best_score, total_notes_hit, battle_wins, battle_losses`,
-            [req.auth.userId, completed ? 1 : 0, score, notesHit]
+            [req.auth.userId, started ? 1 : 0, completed ? 1 : 0, score, notesHit]
         );
 
         if (result.rows.length === 0) {
