@@ -68,6 +68,7 @@ async function initializeDatabase() {
             plays INTEGER NOT NULL DEFAULT 0,
             rating_total INTEGER NOT NULL DEFAULT 0,
             rating_count INTEGER NOT NULL DEFAULT 0,
+            featured BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
@@ -75,6 +76,7 @@ async function initializeDatabase() {
 
     await pool.query("CREATE INDEX IF NOT EXISTS levels_created_idx ON levels (created_at DESC)");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_plays_idx ON levels (plays DESC)");
+    await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS featured BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_author_idx ON levels (LOWER(author))");
 }
 
@@ -119,6 +121,7 @@ function publicLevel(row) {
         ratings: row.rating_count ? [row.rating_total / row.rating_count] : [],
         ratingAverage: row.rating_count ? row.rating_total / row.rating_count : 0,
         ratingCount: row.rating_count,
+        featured: !!row.featured,
         createdAt: row.created_at
     };
 }
@@ -312,7 +315,7 @@ app.get("/api/levels", async (req, res) => {
             values
         );
         let levels = result.rows.map(publicLevel);
-        if (tab === "featured") levels = levels.filter(l => l.ratingAverage >= 4 || l.plays >= 5);
+        if (tab === "featured") levels = levels.filter(l => l.featured);
         res.json(levels);
     } catch (error) {
         console.error("Levels lookup error:", error);
@@ -358,9 +361,12 @@ app.post("/api/levels/:id/play", async (req, res) => {
     }
 });
 
-app.post("/api/levels/:id/rate", async (req, res) => {
+app.post("/api/levels/:id/rate", authenticate, async (req, res) => {
     try {
         const stars = Math.max(1, Math.min(5, Math.floor(Number(req.body.stars) || 0)));
+        if (req.auth.username.toLowerCase() !== "wcrazyness") {
+            return res.status(403).json({ success: false, message: "Only wCrazyNess can rate levels right now." });
+        }
         const result = await pool.query(
             `UPDATE levels SET rating_total = rating_total + $2, rating_count = rating_count + 1, updated_at = NOW()
              WHERE id = $1 RETURNING rating_total, rating_count`,
@@ -371,6 +377,34 @@ app.post("/api/levels/:id/rate", async (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: "Could not rate level" });
     }
+});
+
+app.get("/api/admin/check", authenticate, async (req, res) => {
+    res.json({ success: true, isAdmin: req.auth.username.toLowerCase() === "wcrazyness" });
+});
+
+app.get("/api/admin/levels", authenticate, async (req, res) => {
+    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
+    const result = await pool.query("SELECT * FROM levels ORDER BY created_at DESC LIMIT 200");
+    res.json({ success: true, levels: result.rows.map(publicLevel) });
+});
+
+app.patch("/api/admin/levels/:id/feature", authenticate, async (req, res) => {
+    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
+    const featured = !!req.body.featured;
+    const result = await pool.query(
+        "UPDATE levels SET featured = $2, updated_at = NOW() WHERE id = $1 RETURNING *",
+        [req.params.id, featured]
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+    res.json({ success: true, level: publicLevel(result.rows[0]) });
+});
+
+app.delete("/api/admin/levels/:id", authenticate, async (req, res) => {
+    if (req.auth.username.toLowerCase() !== "wcrazyness") return res.status(403).json({ success: false, message: "Admin access required" });
+    const result = await pool.query("DELETE FROM levels WHERE id = $1 RETURNING id", [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+    res.json({ success: true });
 });
 
 app.delete("/api/levels/:id", authenticate, async (req, res) => {
