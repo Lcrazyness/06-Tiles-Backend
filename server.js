@@ -61,7 +61,10 @@ setInterval(() => { const now = Date.now(); for (const [k, v] of hits) if (v.res
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const isUuid = v => UUID_RE.test(String(v || ""));
+// "Owners" are the usernames in ADMIN_USERNAMES (can't be demoted). Any admin can make other players admins;
+// only owners can take admin away again.
 const isAdminName = name => ADMIN_USERNAMES.includes(String(name || "").trim().toLowerCase());
+const isAdminRow = row => !!row && (isAdminName(row.username) || !!row.is_admin);
 const clampInt = (v, lo, hi, d = 0) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
 const DIFFICULTIES = ["Easy", "Normal", "Hard", "Insane", "Extreme"];
 
@@ -173,6 +176,7 @@ async function initializeDatabase() {
         )
     `);
     await pool.query("CREATE INDEX IF NOT EXISTS admin_notifications_unread_idx ON admin_notifications (read, created_at DESC)");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS list_position INTEGER");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_list_idx ON levels (list_position) WHERE list_position IS NOT NULL");
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
@@ -208,7 +212,7 @@ const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2
 // creator points = how many of YOUR levels are rated.
 const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.games_played, u.games_completed,
     u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses,
-    u.banned_until, u.ban_reason, u.pending_warning,
+    u.banned_until, u.ban_reason, u.pending_warning, u.is_admin,
     COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0)::int AS stars,
     (SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured)::int AS creator_points,
     COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0)::int AS extreme_points,
@@ -230,7 +234,7 @@ function publicUser(user, includeEmail = true) {
         email: includeEmail ? user.email : undefined,
         createdAt: user.created_at,
         profileIcon: user.profile_icon || null,
-        isAdmin: isAdminName(user.username),
+        isAdmin: isAdminRow(user),
         stars: user.stars || 0,
         creatorPoints: user.creator_points || 0,
         extremePoints: user.extreme_points || 0,
@@ -378,10 +382,25 @@ function authenticate(req, res, next) {
     });
 }
 
+const adminCache = new Map();
+async function checkAdmin(userId) {
+    const hit = adminCache.get(userId);
+    if (hit && hit.exp > Date.now()) return hit.value;
+    const r = await pool.query("SELECT username, is_admin FROM users WHERE id = $1", [userId]);
+    const value = r.rows.length ? isAdminRow(r.rows[0]) : false;
+    adminCache.set(userId, { value, exp: Date.now() + 8000 });
+    return value;
+}
+
 function requireAdmin(req, res, next) {
     authenticate(req, res, () => {
-        if (!isAdminName(req.auth.username)) return res.status(403).json({ success: false, message: "Admin access required" });
-        next();
+        checkAdmin(req.auth.userId).then(ok => {
+            if (!ok) return res.status(403).json({ success: false, message: "Admin access required" });
+            next();
+        }).catch(error => {
+            console.error("Admin check error:", error);
+            res.status(500).json({ success: false, message: "Could not verify admin access" });
+        });
     });
 }
 
@@ -691,7 +710,7 @@ app.get("/api/list", async (req, res) => {
 // ---------------------------------------------------------------------------
 // admin
 // ---------------------------------------------------------------------------
-app.get("/api/admin/check", authenticate, (req, res) => res.json({ success: true, isAdmin: isAdminName(req.auth.username) }));
+app.get("/api/admin/check", authenticate, async (req, res) => { try { res.json({ success: true, isAdmin: await checkAdmin(req.auth.userId) }); } catch { res.status(500).json({ success: false }); } });
 
 app.get("/api/admin/overview", requireAdmin, async (req, res) => {
     try {
@@ -821,7 +840,7 @@ app.delete("/api/admin/levels/:id", requireAdmin, async (req, res) => {
 function adminPlayer(u) {
     return {
         id: u.id, username: u.username, email: u.email, profileIcon: u.profile_icon || null, createdAt: u.created_at,
-        isAdmin: isAdminName(u.username), banned: isBanned(u), bannedUntil: isBanned(u) ? u.banned_until : null,
+        isAdmin: isAdminRow(u), owner: isAdminName(u.username), banned: isBanned(u), bannedUntil: isBanned(u) ? u.banned_until : null,
         permanent: isBanned(u) && new Date(u.banned_until).getFullYear() >= 9000, banReason: isBanned(u) ? (u.ban_reason || "") : "",
         pendingWarning: u.pending_warning || null, levelCount: u.level_count || 0, difficultyCounts: u.difficulty_counts || {},
         stars: u.stars || 0, creatorPoints: u.creator_points || 0, extremePoints: u.extreme_points || 0,
@@ -851,7 +870,7 @@ app.get("/api/admin/players", requireAdmin, async (req, res) => {
 
 async function loadTarget(req, res) {
     if (!isUuid(req.params.id)) { res.status(404).json({ success: false, message: "Player not found" }); return null; }
-    const r = await pool.query("SELECT id, username FROM users WHERE id = $1", [req.params.id]);
+    const r = await pool.query("SELECT id, username, is_admin FROM users WHERE id = $1", [req.params.id]);
     if (!r.rows.length) { res.status(404).json({ success: false, message: "Player not found" }); return null; }
     return r.rows[0];
 }
@@ -860,7 +879,7 @@ function socketsOf(userId) { return [...lobby.values()].filter(s => s.data && s.
 app.post("/api/admin/players/:id/ban", requireAdmin, async (req, res) => {
     try {
         const target = await loadTarget(req, res); if (!target) return;
-        if (isAdminName(target.username)) return res.status(400).json({ success: false, message: "You can't ban an admin." });
+        if (isAdminRow(target)) return res.status(400).json({ success: false, message: "You can't ban an admin. Remove their admin role first." });
         const reason = String(req.body.reason || "").trim().slice(0, 300);
         const permanent = !!req.body.permanent;
         const minutes = clampInt(req.body.minutes, 1, 5256000, 0);
@@ -875,6 +894,23 @@ app.post("/api/admin/players/:id/ban", requireAdmin, async (req, res) => {
     } catch (error) {
         console.error("Admin ban error:", error);
         res.status(500).json({ success: false, message: "Could not ban that player" });
+    }
+});
+
+// Give or take away admin. Any admin can grant it; only owners (ADMIN_USERNAMES) can revoke it.
+app.post("/api/admin/players/:id/admin", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const make = !!req.body.admin;
+        if (isAdminName(target.username)) return res.status(400).json({ success: false, message: "That's an owner account; its admin role can't be changed." });
+        if (!make && !isAdminName(req.auth.username)) return res.status(403).json({ success: false, message: "Only an owner can remove someone's admin role." });
+        if (make && isBanned(await fetchUser(target.id))) return res.status(400).json({ success: false, message: "Lift their ban first." });
+        await pool.query("UPDATE users SET is_admin = $2 WHERE id = $1", [target.id, make]);
+        adminCache.delete(target.id);
+        res.json({ success: true, admin: make });
+    } catch (error) {
+        console.error("Admin role error:", error);
+        res.status(500).json({ success: false, message: "Could not change admin access" });
     }
 });
 
