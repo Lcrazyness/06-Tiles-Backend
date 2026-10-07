@@ -64,6 +64,7 @@ const isUuid = v => UUID_RE.test(String(v || ""));
 // "Owners" are the usernames in ADMIN_USERNAMES (can't be demoted). Any admin can make other players admins;
 // only owners can take admin away again.
 const isAdminName = name => ADMIN_USERNAMES.includes(String(name || "").trim().toLowerCase());
+async function modLog(userId, adminName, action, detail) { try { await pool.query("INSERT INTO mod_log (user_id, admin_name, action, detail) VALUES ($1,$2,$3,$4)", [userId, adminName, action, String(detail || "").slice(0, 400)]); } catch (e) { console.error("modLog", e); } }
 const isAdminRow = row => !!row && (isAdminName(row.username) || !!row.is_admin);
 const clampInt = (v, lo, hi, d = 0) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
 const DIFFICULTIES = ["Easy", "Normal", "Hard", "Insane", "Extreme"];
@@ -177,6 +178,31 @@ async function initializeDatabase() {
     `);
     await pool.query("CREATE INDEX IF NOT EXISTS admin_notifications_unread_idx ON admin_notifications (read, created_at DESC)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_stars INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 1000");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cosmetics JSONB NOT NULL DEFAULT '{}'::jsonb");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS flags INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE admin_notifications ADD COLUMN IF NOT EXISTS target_user_id UUID REFERENCES users(id) ON DELETE CASCADE");
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_records (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
+        best_pct SMALLINT NOT NULL DEFAULT 0, best_score BIGINT NOT NULL DEFAULT 0, completed BOOLEAN NOT NULL DEFAULT FALSE,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (user_id, level_id))`);
+    await pool.query("CREATE INDEX IF NOT EXISTS level_records_board_idx ON level_records (level_id, completed DESC, best_pct DESC, best_score DESC)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS daily_claims (user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, day DATE NOT NULL, level_id UUID, PRIMARY KEY (user_id, day))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS reports (id BIGSERIAL PRIMARY KEY, kind VARCHAR(10) NOT NULL, level_id UUID REFERENCES levels(id) ON DELETE CASCADE,
+        target_user_id UUID REFERENCES users(id) ON DELETE CASCADE, reporter_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, reason TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS mod_log (id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, admin_name VARCHAR(30) NOT NULL,
+        action VARCHAR(20) NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS friendships (user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, friend_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(10) NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (user_id, friend_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_comments (id BIGSERIAL PRIMARY KEY, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, username VARCHAR(20) NOT NULL, text VARCHAR(300) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE INDEX IF NOT EXISTS level_comments_idx ON level_comments (level_id, created_at DESC)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_versions (id BIGSERIAL PRIMARY KEY, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE, snapshot JSONB NOT NULL, saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE INDEX IF NOT EXISTS level_versions_idx ON level_versions (level_id, saved_at DESC)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS drafts (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL,
+        name VARCHAR(80) NOT NULL, data JSONB NOT NULL, verifier_id UUID REFERENCES users(id) ON DELETE SET NULL, collaborators JSONB NOT NULL DEFAULT '[]'::jsonb,
+        verified BOOLEAN NOT NULL DEFAULT FALSE, verified_by VARCHAR(20), rev INTEGER NOT NULL DEFAULT 1, level_id UUID REFERENCES levels(id) ON DELETE SET NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS list_position INTEGER");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_list_idx ON levels (list_position) WHERE list_position IS NOT NULL");
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
@@ -213,7 +239,7 @@ const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2
 const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.games_played, u.games_completed,
     u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses,
     u.banned_until, u.ban_reason, u.pending_warning, u.is_admin,
-    COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0)::int AS stars,
+    (COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0) + u.bonus_stars)::int AS stars, u.elo, u.cosmetics, u.flags,
     (SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured)::int AS creator_points,
     COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0)::int AS extreme_points,
     (SELECT COUNT(*) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL)::int AS list_beaten,
@@ -227,7 +253,39 @@ async function fetchUser(id) {
 
 const isBanned = user => !!(user && user.banned_until && new Date(user.banned_until).getTime() > Date.now());
 
+const XP_TITLES = [[1, "Rookie"], [5, "Tapper"], [10, "Rhythm Runner"], [20, "Tile Master"], [35, "Legend"], [50, "Mythic"]];
+const xpOf = u => Number(u.total_notes_hit || 0) + (u.games_completed || 0) * 50 + (u.stars || 0) * 100 + (u.extreme_points || 0) * 5 + (u.battle_wins || 0) * 40 + (u.creator_points || 0) * 150;
+const levelOfXp = xp => Math.floor(Math.sqrt(xp / 100)) + 1;
+const titleOfLevel = lv => XP_TITLES.filter(t => lv >= t[0]).pop()[1];
+
+const ACHIEVEMENTS = [
+    ["first_clear", u => u.games_completed >= 1], ["rated_clear", u => u.stars >= 1], ["insane", u => u.hardest_rank >= 4], ["extreme", u => u.hardest_rank >= 5],
+    ["notes_1k", u => Number(u.total_notes_hit) >= 1000], ["notes_10k", u => Number(u.total_notes_hit) >= 10000],
+    ["win_1", u => u.battle_wins >= 1], ["win_10", u => u.battle_wins >= 10], ["creator_1", u => u.creator_points >= 1], ["list_1", u => u.list_beaten >= 1],
+    ["stars_25", u => u.stars >= 25], ["stars_100", u => u.stars >= 100], ["ep_500", u => u.extreme_points >= 500], ["level_10", u => u.level >= 10], ["elo_1200", u => u.elo >= 1200]
+];
+
+// What each cosmetic needs. "default" ones are always available.
+const COSMETICS = {
+    tile:  { default: () => true, ice: u => u.stars >= 5, gold: u => u.stars >= 25, neon: u => u.extreme_points >= 100, royal: u => u.creator_points >= 1 },
+    fx:    { default: () => true, sparkle: u => u.stars >= 10, fire: u => u.extreme_points >= 250, confetti: u => u.battle_wins >= 5 },
+    frame: { none: () => true, bronze: u => u.level >= 5, silver: u => u.level >= 15, gold: u => u.level >= 30, creator: u => u.creator_points >= 1, list: u => u.list_beaten >= 1 }
+};
+function cosmeticState(u) {
+    const unlocked = {}, equipped = {};
+    for (const kind of Object.keys(COSMETICS)) {
+        unlocked[kind] = Object.keys(COSMETICS[kind]).filter(id => COSMETICS[kind][id](u));
+        const want = (u.cosmetics || {})[kind];
+        equipped[kind] = unlocked[kind].includes(want) ? want : Object.keys(COSMETICS[kind])[0];
+    }
+    return { unlocked, equipped };
+}
+
 function publicUser(user, includeEmail = true) {
+    const xp = xpOf(user);
+    const level = levelOfXp(xp);
+    const u = Object.assign({}, user, { level });
+    const cos = cosmeticState(u);
     const out = {
         id: user.id,
         username: user.username,
@@ -242,6 +300,10 @@ function publicUser(user, includeEmail = true) {
         hardestDifficulty: DIFF_BY_RANK[user.hardest_rank || 0] || null,
         hardestRank: user.hardest_rank || 0,
         difficultyCounts: user.difficulty_counts || {},
+        xp, level, title: titleOfLevel(level), xpNext: 100 * level * level,
+        elo: user.elo || 1000,
+        cosmetics: cos.equipped,
+        achievements: ACHIEVEMENTS.filter(([, f]) => f(u)).map(([id]) => id),
         statistics: {
             gamesPlayed: user.games_played,
             gamesCompleted: user.games_completed,
@@ -252,8 +314,7 @@ function publicUser(user, includeEmail = true) {
             battleLosses: user.battle_losses
         }
     };
-    // only ever sent to the player themselves (includeEmail doubles as "this is me")
-    if (includeEmail) out.warning = user.pending_warning || null;
+    if (includeEmail) { out.warning = user.pending_warning || null; out.unlocked = cos.unlocked; }
     return out;
 }
 
@@ -287,7 +348,9 @@ function publicLevel(row, full = false) {
         backgroundColor: meta.backgroundColor || "#202738",
         backgroundBrightness: meta.backgroundBrightness || 100,
         bpm: meta.bpm || 120,
-        gridOffset: meta.gridOffset || 0
+        gridOffset: meta.gridOffset || 0,
+        strictMode: !!meta.strictMode,
+        tags: Array.isArray(meta.tags) ? meta.tags : []
     };
     if (full) {
         level.data = row.level_data || [];
@@ -310,12 +373,15 @@ function sanitizeNotes(data) {
     return out;
 }
 
+const ALLOWED_TAGS = ["speed", "chords", "holds", "memory", "tech", "long", "short", "jumps", "streams", "strict", "beginner"];
+
 function sanitizeEffects(effects) {
     if (!Array.isArray(effects)) return [];
     return effects
         .filter(e => e && typeof e === "object" && typeof e.type === "string" && Number.isFinite(Number(e.time)))
         .filter(e => !e.src || (typeof e.src === "string" && e.src.length < 3000000))
-        .slice(0, 500);
+        .filter(e => e.url === undefined || (typeof e.url === "string" && /^https:\/\/[^\s"'<>]{4,490}$/i.test(e.url)))
+        .slice(0, 600);
 }
 
 function sanitizeLevel(body) {
@@ -330,6 +396,8 @@ function sanitizeLevel(body) {
     if (Number.isFinite(Number(level.backgroundBrightness))) meta.backgroundBrightness = clampInt(level.backgroundBrightness, 70, 140, 100);
     if (Number.isFinite(Number(level.bpm))) meta.bpm = clampInt(level.bpm, 30, 300, 120);
     if (Number.isFinite(Number(level.gridOffset))) meta.gridOffset = Math.max(-5, Math.min(5, Number(level.gridOffset)));
+    if (level.strictMode) meta.strictMode = true;
+    if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
     return {
         name, notes, icon, meta,
         effects: sanitizeEffects(level.effects),
@@ -496,39 +564,248 @@ app.patch("/api/profile", authenticate, async (req, res) => {
 // Stats only count games played on levels from the Browse > Levels tab, and never on
 // your own levels. Completing an admin-rated level also records the completion that
 // powers stars + "difficulty beaten".
+const DAILY_BONUS_STARS = 3;
+const todayKey = () => new Date().toISOString().slice(0, 10);
+async function getDailyLevelRow() {
+    const r = await pool.query(`SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels WHERE featured = TRUE ORDER BY md5(id::text || $1) LIMIT 1`, [todayKey()]);
+    return r.rows[0] || null;
+}
+function suspicious(userId, username, levelId, levelName, why) {
+    pool.query("UPDATE users SET flags = flags + 1 WHERE id = $1 RETURNING flags", [userId]).then(r => {
+        const flags = r.rows[0] ? r.rows[0].flags : 0;
+        pool.query(`INSERT INTO admin_notifications (type, level_id, user_id, target_user_id, message) VALUES ('suspicious', $1, $2, $2, $3)
+                    ON CONFLICT (type, level_id, user_id) DO UPDATE SET read = FALSE, created_at = NOW(), message = EXCLUDED.message`,
+            [levelId, userId, username + " sent an impossible result on \"" + levelName + "\" (" + why + ")"]).catch(() => {});
+        if (flags > 0 && flags % 3 === 0) {
+            pool.query("INSERT INTO admin_notifications (type, user_id, target_user_id, message) VALUES ('auto_flag', $1, $1, $2)",
+                [userId, username + " has been flagged " + flags + " times for suspicious results - consider a ban"]).catch(() => {});
+        }
+    }).catch(() => {});
+}
+
+// Stats only count games played on levels from the Browse tabs, and never on your own levels.
+// Results are sanity-checked against the level itself (note count, length) before they count.
 app.post("/api/stats/game", authenticate, async (req, res) => {
     try {
         const me = req.auth.userId;
         const levelId = String(req.body.levelId || "");
-        let counted = false;
+        let counted = false, dailyBonus = 0;
         if (isUuid(levelId)) {
-            const lvl = await pool.query("SELECT author_id FROM levels WHERE id = $1", [levelId]);
-            counted = lvl.rows.length > 0 && lvl.rows[0].author_id !== me;
-        }
-        if (counted) {
-            const completed = !!req.body.completed;
-            const score = Math.max(0, Math.min(1e9, Math.floor(Number(req.body.score) || 0)));
-            const notesHit = Math.max(0, Math.min(1e6, Math.floor(Number(req.body.notesHit) || 0)));
-            await pool.query(
-                `UPDATE users SET games_played = games_played + 1, games_completed = games_completed + $2,
-                    total_score = total_score + $3, best_score = GREATEST(best_score, $3),
-                    total_notes_hit = total_notes_hit + $4, updated_at = NOW()
-                 WHERE id = $1`,
-                [me, completed ? 1 : 0, score, notesHit]
-            );
-            if (completed) {
-                await pool.query(
-                    `INSERT INTO level_completions (user_id, level_id, best_score) VALUES ($1, $2, $3)
-                     ON CONFLICT (user_id, level_id) DO UPDATE SET best_score = GREATEST(level_completions.best_score, EXCLUDED.best_score), completed_at = NOW()`,
-                    [me, levelId, score]
-                );
+            const lvl = await pool.query(`SELECT author_id, name, jsonb_array_length(level_data) AS notes,
+                COALESCE((SELECT MAX((e->>'time')::float) FROM jsonb_array_elements(level_data) e), 0) AS last_time FROM levels WHERE id = $1`, [levelId]);
+            const row = lvl.rows[0];
+            counted = !!row && row.author_id !== me;
+            if (counted) {
+                let completed = !!req.body.completed;
+                let score = Math.max(0, Math.min(1e9, Math.floor(Number(req.body.score) || 0)));
+                let notesHit = Math.max(0, Math.min(1e6, Math.floor(Number(req.body.notesHit) || 0)));
+                const elapsed = Number(req.body.elapsed) || 0;
+                let pct = clampInt(req.body.pct, 0, 100, 0);
+                const noteCount = Number(row.notes), lastTime = Number(row.last_time);
+                let why = null;
+                if (notesHit > noteCount + 5) why = "more notes than the level has";
+                else if (score > noteCount * 30 + 1000) why = "score too high for the level";
+                else if (completed && elapsed > 0 && elapsed < lastTime * 0.8) why = "finished faster than the level is long";
+                else if (completed && notesHit < noteCount * 0.4) why = "completed with too few notes hit";
+                if (why) { suspicious(me, req.auth.username, levelId, row.name, why); completed = false; counted = false; }
+                if (counted) {
+                    if (completed) pct = 100;
+                    await pool.query(
+                        `UPDATE users SET games_played = games_played + 1, games_completed = games_completed + $2,
+                            total_score = total_score + $3, best_score = GREATEST(best_score, $3),
+                            total_notes_hit = total_notes_hit + $4, updated_at = NOW() WHERE id = $1`,
+                        [me, completed ? 1 : 0, score, notesHit]);
+                    await pool.query(
+                        `INSERT INTO level_records (user_id, level_id, best_pct, best_score, completed) VALUES ($1,$2,$3,$4,$5)
+                         ON CONFLICT (user_id, level_id) DO UPDATE SET best_pct = GREATEST(level_records.best_pct, EXCLUDED.best_pct),
+                            best_score = GREATEST(level_records.best_score, EXCLUDED.best_score), completed = level_records.completed OR EXCLUDED.completed, updated_at = NOW()`,
+                        [me, levelId, pct, score, completed]);
+                    if (completed) {
+                        await pool.query(
+                            `INSERT INTO level_completions (user_id, level_id, best_score) VALUES ($1, $2, $3)
+                             ON CONFLICT (user_id, level_id) DO UPDATE SET best_score = GREATEST(level_completions.best_score, EXCLUDED.best_score), completed_at = NOW()`,
+                            [me, levelId, score]);
+                        const daily = await getDailyLevelRow();
+                        if (daily && daily.id === levelId) {
+                            const claim = await pool.query("INSERT INTO daily_claims (user_id, day, level_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING day", [me, todayKey(), levelId]);
+                            if (claim.rows.length) { await pool.query("UPDATE users SET bonus_stars = bonus_stars + $2 WHERE id = $1", [me, DAILY_BONUS_STARS]); dailyBonus = DAILY_BONUS_STARS; }
+                        }
+                    }
+                }
             }
         }
-        res.json({ success: true, counted, user: publicUser(await fetchUser(me)) });
+        res.json({ success: true, counted, dailyBonus, user: publicUser(await fetchUser(me)) });
     } catch (error) {
         console.error("Game stats update error:", error);
         res.status(500).json({ success: false, message: "Could not update game statistics" });
     }
+});
+
+app.get("/api/my/progress", authenticate, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT level_id, best_pct, best_score, completed FROM level_records WHERE user_id = $1", [req.auth.userId]);
+        res.json({ success: true, progress: r.rows.map(x => ({ levelId: x.level_id, bestPct: x.best_pct, bestScore: Number(x.best_score), completed: x.completed })) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load your progress" }); }
+});
+
+app.get("/api/levels/:id/leaderboard", async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const r = await pool.query(
+            `SELECT u.username, u.profile_icon, u.cosmetics, r.best_pct, r.best_score, r.completed FROM level_records r JOIN users u ON u.id = r.user_id
+             WHERE r.level_id = $1 AND (u.banned_until IS NULL OR u.banned_until < NOW())
+             ORDER BY r.completed DESC, r.best_pct DESC, r.best_score DESC LIMIT 25`, [req.params.id]);
+        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.best_pct, score: Number(x.best_score), completed: x.completed })) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
+});
+
+app.get("/api/daily", async (req, res) => {
+    try {
+        const row = await getDailyLevelRow();
+        let claimed = false;
+        const [scheme, token] = (req.headers.authorization || "").split(" ");
+        if (row && scheme === "Bearer" && token) {
+            try { const p = jwt.verify(token, JWT_SECRET); claimed = (await pool.query("SELECT 1 FROM daily_claims WHERE user_id = $1 AND day = $2", [p.userId, todayKey()])).rows.length > 0; } catch {}
+        }
+        res.json({ success: true, bonusStars: DAILY_BONUS_STARS, claimed, level: row ? publicLevel(row) : null });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load the daily level" }); }
+});
+
+app.patch("/api/profile/cosmetics", authenticate, async (req, res) => {
+    try {
+        const u = await fetchUser(req.auth.userId);
+        const pub = publicUser(u);
+        const next = {};
+        for (const kind of Object.keys(COSMETICS)) {
+            const want = String(req.body[kind] || pub.cosmetics[kind]);
+            if (!pub.unlocked[kind].includes(want)) return res.status(400).json({ success: false, message: "You haven't unlocked that " + kind + " yet." });
+            next[kind] = want;
+        }
+        await pool.query("UPDATE users SET cosmetics = $2::jsonb WHERE id = $1", [req.auth.userId, JSON.stringify(next)]);
+        res.json({ success: true, user: publicUser(await fetchUser(req.auth.userId)) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not save cosmetics" }); }
+});
+
+// --- reports ---
+app.post("/api/reports", authenticate, rateLimit("report", 15, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const kind = req.body.kind === "player" ? "player" : "level";
+        const reason = String(req.body.reason || "").trim().slice(0, 300);
+        if (!reason) return res.status(400).json({ success: false, message: "Tell us what's wrong." });
+        let levelId = null, targetId = null, label = "";
+        if (kind === "level") {
+            if (!isUuid(String(req.body.levelId))) return res.status(404).json({ success: false, message: "Level not found" });
+            const l = await pool.query("SELECT id, name, author FROM levels WHERE id = $1", [req.body.levelId]);
+            if (!l.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+            levelId = l.rows[0].id; label = "level \"" + l.rows[0].name + "\" by " + l.rows[0].author;
+        } else {
+            const t = await pool.query("SELECT id, username FROM users WHERE LOWER(username) = LOWER($1)", [String(req.body.username || "")]);
+            if (!t.rows.length) return res.status(404).json({ success: false, message: "Player not found" });
+            if (t.rows[0].id === req.auth.userId) return res.status(400).json({ success: false, message: "You can't report yourself." });
+            targetId = t.rows[0].id; label = "player " + t.rows[0].username;
+        }
+        await pool.query("INSERT INTO reports (kind, level_id, target_user_id, reporter_id, reason) VALUES ($1,$2,$3,$4,$5)", [kind, levelId, targetId, req.auth.userId, reason]);
+        await pool.query(
+            `INSERT INTO admin_notifications (type, level_id, user_id, target_user_id, message) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (type, level_id, user_id) DO UPDATE SET read = FALSE, created_at = NOW(), message = EXCLUDED.message`,
+            [kind === "level" ? "report" : "report_player", levelId, req.auth.userId, targetId, req.auth.username + " reported " + label + ": " + reason]);
+        const count = (await pool.query("SELECT COUNT(DISTINCT reporter_id)::int AS n FROM reports WHERE " + (kind === "level" ? "level_id = $1" : "target_user_id = $1"), [kind === "level" ? levelId : targetId])).rows[0].n;
+        if (count > 0 && count % 3 === 0) {
+            await pool.query("INSERT INTO admin_notifications (type, level_id, user_id, target_user_id, message) VALUES ('auto_flag', $1, NULL, $2, $3)",
+                [levelId, targetId, count + " different players have reported " + label + " - review it"]);
+        }
+        res.json({ success: true });
+    } catch (error) { console.error("Report error:", error); res.status(500).json({ success: false, message: "Could not send the report" }); }
+});
+
+// --- comments ---
+app.get("/api/levels/:id/comments", async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const r = await pool.query("SELECT id, user_id, username, text, created_at FROM level_comments WHERE level_id = $1 ORDER BY created_at DESC LIMIT 50", [req.params.id]);
+        res.json({ success: true, comments: r.rows.map(c => ({ id: Number(c.id), userId: c.user_id, username: c.username, text: c.text, createdAt: c.created_at })) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load comments" }); }
+});
+app.post("/api/levels/:id/comments", authenticate, rateLimit("comment", 30, 60 * 60 * 1000), async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const text = String(req.body.text || "").trim().slice(0, 300);
+        if (!text) return res.status(400).json({ success: false, message: "Write something first." });
+        const r = await pool.query("INSERT INTO level_comments (level_id, user_id, username, text) SELECT id, $2, $3, $4 FROM levels WHERE id = $1 RETURNING id", [req.params.id, req.auth.userId, req.auth.username, text]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not post comment" }); }
+});
+app.delete("/api/comments/:id", authenticate, async (req, res) => {
+    try {
+        const admin = await checkAdmin(req.auth.userId);
+        const r = await pool.query("DELETE FROM level_comments WHERE id = $1 AND ($2 OR user_id = $3) RETURNING id", [clampInt(req.params.id, 1, 9e15, 0), admin, req.auth.userId]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Comment not found" });
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not delete comment" }); }
+});
+
+// --- friends ---
+app.get("/api/friends", authenticate, async (req, res) => {
+    try {
+        const me = req.auth.userId;
+        const r = await pool.query(
+            `SELECT f.user_id, f.friend_id, f.status, u.id AS other_id, u.username, u.profile_icon, u.cosmetics
+             FROM friendships f JOIN users u ON u.id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END
+             WHERE f.user_id = $1 OR f.friend_id = $1`, [me]);
+        const online = new Map([...lobby.values()].filter(s => s.data.userId).map(s => [s.data.userId, s]));
+        res.json({ success: true, friends: r.rows.map(x => {
+            const sock = online.get(x.other_id);
+            return { userId: x.other_id, username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none",
+                state: x.status === "accepted" ? "friend" : (x.user_id === me ? "outgoing" : "incoming"),
+                online: !!sock, status: sock ? sock.data.status : "offline", socketId: sock ? sock.id : null };
+        }) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not load friends" }); }
+});
+app.post("/api/friends/request", authenticate, rateLimit("friendreq", 30, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const me = req.auth.userId;
+        const t = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [String(req.body.username || "").trim()]);
+        if (!t.rows.length) return res.status(404).json({ success: false, message: "No player with that name." });
+        const other = t.rows[0].id;
+        if (other === me) return res.status(400).json({ success: false, message: "That's you!" });
+        const existing = await pool.query("SELECT user_id, status FROM friendships WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)", [me, other]);
+        if (existing.rows.length) {
+            const e = existing.rows[0];
+            if (e.status === "accepted") return res.status(400).json({ success: false, message: "You're already friends." });
+            if (e.user_id === other) { await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, me]); return res.json({ success: true, accepted: true }); }
+            return res.status(400).json({ success: false, message: "Request already sent." });
+        }
+        await pool.query("INSERT INTO friendships (user_id, friend_id) VALUES ($1,$2)", [me, other]);
+        socketsOf(other).forEach(sk => sk.emit("friend_request", { from: req.auth.username }));
+        res.json({ success: true });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not send the request" }); }
+});
+app.post("/api/friends/respond", authenticate, async (req, res) => {
+    try {
+        const other = String(req.body.userId || "");
+        if (!isUuid(other)) return res.status(404).json({ success: false });
+        if (req.body.accept) await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, req.auth.userId]);
+        else await pool.query("DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2", [other, req.auth.userId]);
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not update the request" }); }
+});
+app.delete("/api/friends/:userId", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.userId)) return res.status(404).json({ success: false });
+        await pool.query("DELETE FROM friendships WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)", [req.auth.userId, req.params.userId]);
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not remove friend" }); }
+});
+
+// --- creator profile ---
+app.get("/api/creators/:username", async (req, res) => {
+    try {
+        const u = await pool.query(`SELECT ${USER_FULL} FROM users u WHERE LOWER(u.username) = LOWER($1) AND (u.banned_until IS NULL OR u.banned_until < NOW())`, [String(req.params.username)]);
+        if (!u.rows.length) return res.status(404).json({ success: false, message: "Player not found" });
+        const l = await pool.query(`SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels WHERE author_id = $1 ORDER BY featured DESC, created_at DESC LIMIT 100`, [u.rows[0].id]);
+        res.json({ success: true, user: publicUser(u.rows[0], false), levels: l.rows.map(r => publicLevel(r)) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load that creator" }); }
 });
 
 // ---------------------------------------------------------------------------
@@ -552,6 +829,9 @@ app.get("/api/levels", async (req, res) => {
             where.push(`(LOWER(name) LIKE $${values.length} OR LOWER(author) LIKE $${values.length})`);
         }
         if (tab === "featured") where.push("featured = TRUE");
+        const tag = String(req.query.tag || "").toLowerCase();
+        if (ALLOWED_TAGS.includes(tag)) { values.push(tag); where.push(`meta->'tags' @> to_jsonb($${values.length}::text)`); }
+        if (DIFFICULTIES.includes(String(req.query.difficulty || ""))) { values.push(req.query.difficulty); where.push(`difficulty = $${values.length}`); }
         const result = await pool.query(
             `SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${order} LIMIT 100`,
             values
@@ -666,6 +946,35 @@ app.delete("/api/levels/:id", authenticate, async (req, res) => {
     }
 });
 
+// Keep the last 10 versions of a level so the author can roll back.
+async function snapshotLevel(levelId, authorId) {
+    const r = await pool.query("SELECT name, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta FROM levels WHERE id = $1 AND author_id = $2", [levelId, authorId]);
+    if (!r.rows.length) return;
+    await pool.query("INSERT INTO level_versions (level_id, snapshot) VALUES ($1, $2::jsonb)", [levelId, JSON.stringify(r.rows[0])]);
+    await pool.query("DELETE FROM level_versions WHERE level_id = $1 AND id NOT IN (SELECT id FROM level_versions WHERE level_id = $1 ORDER BY saved_at DESC LIMIT 10)", [levelId]);
+}
+app.get("/api/levels/:id/versions", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false });
+        const own = await pool.query("SELECT 1 FROM levels WHERE id = $1 AND author_id = $2", [req.params.id, req.auth.userId]);
+        if (!own.rows.length) return res.status(404).json({ success: false, message: "Level not found or you do not own it" });
+        const r = await pool.query("SELECT id, saved_at, snapshot->>'name' AS name, jsonb_array_length(snapshot->'level_data') AS tiles FROM level_versions WHERE level_id = $1 ORDER BY saved_at DESC", [req.params.id]);
+        res.json({ success: true, versions: r.rows.map(v => ({ id: Number(v.id), savedAt: v.saved_at, name: v.name, tiles: v.tiles })) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load versions" }); }
+});
+app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false });
+        const v = await pool.query("SELECT v.snapshot FROM level_versions v JOIN levels l ON l.id = v.level_id WHERE v.id = $1 AND v.level_id = $2 AND l.author_id = $3", [clampInt(req.body.versionId, 1, 9e15, 0), req.params.id, req.auth.userId]);
+        if (!v.rows.length) return res.status(404).json({ success: false, message: "Version not found" });
+        await snapshotLevel(req.params.id, req.auth.userId);
+        const x = v.rows[0].snapshot;
+        await pool.query(`UPDATE levels SET name=$2, icon=$3, level_data=$4::jsonb, effects=$5::jsonb, lives=$6, fps=$7, audio_offset=$8, disable_holds=$9, difficulty=$10, meta=$11::jsonb, updated_at=NOW() WHERE id=$1`,
+            [req.params.id, x.name, x.icon, JSON.stringify(x.level_data), JSON.stringify(x.effects), x.lives, x.fps, x.audio_offset, x.disable_holds, x.difficulty, JSON.stringify(x.meta || {})]);
+        res.json({ success: true });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not roll back" }); }
+});
+
 // Update one of YOUR published levels in place (ratings, plays, rated status and completions are kept).
 // Rated levels also ping the admin so they can re-check the change.
 app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000), async (req, res) => {
@@ -673,6 +982,7 @@ app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const clean = sanitizeLevel(req.body);
         if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        await snapshotLevel(req.params.id, req.auth.userId);
         const result = await pool.query(
             `UPDATE levels SET name=$3, icon=$4, level_data=$5::jsonb, effects=$6::jsonb, lives=$7, fps=$8, audio_offset=$9,
                 disable_holds=$10, difficulty=$11, meta=$12::jsonb, updated_at=NOW()
@@ -694,6 +1004,113 @@ app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000
         console.error("Level update error:", error);
         res.status(500).json({ success: false, message: "Could not update level" });
     }
+});
+
+// ---------------------------------------------------------------------------
+// shared drafts: edit a level together; a set verifier has to beat it before it can be published
+// ---------------------------------------------------------------------------
+function draftRole(d, userId) {
+    if (d.owner_id === userId) return "owner";
+    if (d.verifier_id === userId) return "verifier";
+    if ((d.collaborators || []).includes(userId)) return "editor";
+    return null;
+}
+async function draftSummary(d, userId) {
+    const ids = [...(d.collaborators || []), d.verifier_id].filter(Boolean);
+    const names = ids.length ? (await pool.query("SELECT id, username FROM users WHERE id = ANY($1::uuid[])", [ids])).rows : [];
+    const nameOf = id => (names.find(n => n.id === id) || {}).username || "?";
+    return { id: d.id, name: d.name, owner: d.owner, role: draftRole(d, userId), verified: d.verified, verifiedBy: d.verified_by, rev: d.rev, updatedAt: d.updated_at,
+        tileCount: Array.isArray(d.data && d.data.data) ? d.data.data.length : 0, published: !!d.level_id,
+        collaborators: (d.collaborators || []).map(nameOf), verifier: d.verifier_id ? nameOf(d.verifier_id) : null };
+}
+app.get("/api/drafts", authenticate, async (req, res) => {
+    try {
+        const me = req.auth.userId;
+        const r = await pool.query("SELECT * FROM drafts WHERE owner_id = $1 OR verifier_id = $1 OR collaborators ? $2 ORDER BY updated_at DESC LIMIT 50", [me, me]);
+        res.json({ success: true, drafts: await Promise.all(r.rows.map(d => draftSummary(d, me))) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not load shared levels" }); }
+});
+app.post("/api/drafts", authenticate, rateLimit("draft", 60, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const clean = sanitizeLevel(req.body);
+        if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        const r = await pool.query("INSERT INTO drafts (owner_id, owner, name, data) VALUES ($1,$2,$3,$4::jsonb) RETURNING *", [req.auth.userId, req.auth.username, clean.name, JSON.stringify(req.body)]);
+        res.status(201).json({ success: true, draft: await draftSummary(r.rows[0], req.auth.userId) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not share the level" }); }
+});
+async function loadDraft(req, res, roles) {
+    if (!isUuid(req.params.id)) { res.status(404).json({ success: false, message: "Shared level not found" }); return null; }
+    const r = await pool.query("SELECT * FROM drafts WHERE id = $1", [req.params.id]);
+    const d = r.rows[0];
+    const role = d && draftRole(d, req.auth.userId);
+    if (!d || !role || (roles && !roles.includes(role))) { res.status(d && role ? 403 : 404).json({ success: false, message: d && role ? "You can't do that on this level." : "Shared level not found" }); return null; }
+    d._role = role;
+    return d;
+}
+app.get("/api/drafts/:id", authenticate, async (req, res) => {
+    try { const d = await loadDraft(req, res); if (!d) return; res.json({ success: true, draft: await draftSummary(d, req.auth.userId), level: d.data }); }
+    catch (error) { res.status(500).json({ success: false, message: "Could not open the shared level" }); }
+});
+app.put("/api/drafts/:id", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res, ["owner", "editor"]); if (!d) return;
+        const clean = sanitizeLevel(req.body.level);
+        if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        if (Number(req.body.rev) !== d.rev) return res.status(409).json({ success: false, conflict: true, message: "Someone else saved a newer version. Reload it (your copy is still in My Levels)." });
+        const r = await pool.query("UPDATE drafts SET data = $2::jsonb, name = $3, rev = rev + 1, verified = FALSE, verified_by = NULL, updated_at = NOW() WHERE id = $1 RETURNING *", [d.id, JSON.stringify(req.body.level), clean.name]);
+        res.json({ success: true, draft: await draftSummary(r.rows[0], req.auth.userId) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not save the shared level" }); }
+});
+app.post("/api/drafts/:id/share", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res, ["owner"]); if (!d) return;
+        const t = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [String(req.body.username || "").trim()]);
+        if (!t.rows.length) return res.status(404).json({ success: false, message: "No player with that name." });
+        const other = t.rows[0].id;
+        if (other === d.owner_id) return res.status(400).json({ success: false, message: "That's you." });
+        const role = String(req.body.role || "editor");
+        let collabs = (d.collaborators || []).filter(x => x !== other), verifier = d.verifier_id === other ? null : d.verifier_id;
+        if (role === "editor") collabs.push(other);
+        else if (role === "verifier") verifier = other;
+        else if (role !== "remove") return res.status(400).json({ success: false, message: "Unknown role." });
+        await pool.query("UPDATE drafts SET collaborators = $2::jsonb, verifier_id = $3, verified = CASE WHEN $3::uuid IS DISTINCT FROM verifier_id THEN FALSE ELSE verified END WHERE id = $1", [d.id, JSON.stringify(collabs), verifier]);
+        res.json({ success: true });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not update sharing" }); }
+});
+// The verifier (or the owner, when no verifier is set) reports a completed verification run of revision `rev`.
+app.post("/api/drafts/:id/verified", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res); if (!d) return;
+        const allowed = d.verifier_id ? d._role === "verifier" : d._role === "owner";
+        if (!allowed) return res.status(403).json({ success: false, message: d.verifier_id ? "Only the assigned verifier can verify this level." : "Only the owner can verify this level." });
+        if (Number(req.body.rev) !== d.rev) return res.status(409).json({ success: false, message: "The level changed while you were verifying. Reload it and verify again." });
+        await pool.query("UPDATE drafts SET verified = TRUE, verified_by = $2 WHERE id = $1", [d.id, req.auth.username]);
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not record the verification" }); }
+});
+app.post("/api/drafts/:id/publish", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res, ["owner"]); if (!d) return;
+        if (!d.verified) return res.status(400).json({ success: false, message: d.verifier_id ? "Your verifier hasn't verified the latest version yet." : "Verify the level first." });
+        const clean = sanitizeLevel(d.data);
+        if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        let row;
+        if (d.level_id) {
+            await snapshotLevel(d.level_id, d.owner_id);
+            row = (await pool.query(`UPDATE levels SET name=$3, icon=$4, level_data=$5::jsonb, effects=$6::jsonb, lives=$7, fps=$8, audio_offset=$9, disable_holds=$10, difficulty=$11, meta=$12::jsonb, updated_at=NOW() WHERE id=$1 AND author_id=$2 RETURNING *`,
+                [d.level_id, d.owner_id, clean.name, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
+        }
+        if (!row) {
+            row = (await pool.query(`INSERT INTO levels (name, author_id, author, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`,
+                [clean.name, d.owner_id, d.owner, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
+            await pool.query("UPDATE drafts SET level_id = $2 WHERE id = $1", [d.id, row.id]);
+        }
+        res.json({ success: true, level: publicLevel(row) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not publish" }); }
+});
+app.delete("/api/drafts/:id", authenticate, async (req, res) => {
+    try { const d = await loadDraft(req, res, ["owner"]); if (!d) return; await pool.query("DELETE FROM drafts WHERE id = $1", [d.id]); res.json({ success: true }); }
+    catch (error) { res.status(500).json({ success: false, message: "Could not delete" }); }
 });
 
 // The LIST: admin-ranked levels, #1 first.
@@ -733,13 +1150,13 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
 app.get("/api/admin/notifications", requireAdmin, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT n.id, n.type, n.level_id, n.message, n.read, n.created_at, l.name AS level_name, l.author AS level_author, l.featured AS level_rated
-             FROM admin_notifications n LEFT JOIN levels l ON l.id = n.level_id
+            `SELECT n.id, n.type, n.level_id, n.message, n.read, n.created_at, l.name AS level_name, l.author AS level_author, l.featured AS level_rated, tu.username AS target_username
+             FROM admin_notifications n LEFT JOIN levels l ON l.id = n.level_id LEFT JOIN users tu ON tu.id = n.target_user_id
              ORDER BY n.read ASC, n.created_at DESC LIMIT 50`
         );
         res.json({ success: true, notifications: result.rows.map(r => ({
             id: Number(r.id), type: r.type, levelId: r.level_id, message: r.message, read: r.read, createdAt: r.created_at,
-            levelName: r.level_name, levelAuthor: r.level_author, levelRated: !!r.level_rated
+            levelName: r.level_name, levelAuthor: r.level_author, levelRated: !!r.level_rated, targetUsername: r.target_username || null
         })) });
     } catch (error) {
         console.error("Admin notifications error:", error);
@@ -876,6 +1293,17 @@ async function loadTarget(req, res) {
 }
 function socketsOf(userId) { return [...lobby.values()].filter(s => s.data && s.data.userId === userId); }
 
+app.get("/api/admin/players/:id/history", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const [log, reps, flags] = await Promise.all([
+            pool.query("SELECT admin_name, action, detail, created_at FROM mod_log WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50", [target.id]),
+            pool.query("SELECT COUNT(*)::int AS n FROM reports WHERE target_user_id = $1", [target.id]),
+            pool.query("SELECT flags FROM users WHERE id = $1", [target.id])]);
+        res.json({ success: true, reports: reps.rows[0].n, flags: flags.rows[0].flags, history: log.rows.map(h => ({ admin: h.admin_name, action: h.action, detail: h.detail, at: h.created_at })) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load history" }); }
+});
+
 app.post("/api/admin/players/:id/ban", requireAdmin, async (req, res) => {
     try {
         const target = await loadTarget(req, res); if (!target) return;
@@ -888,6 +1316,7 @@ app.post("/api/admin/players/:id/ban", requireAdmin, async (req, res) => {
             ? await pool.query("UPDATE users SET banned_until = '9999-12-31T00:00:00Z', ban_reason = $2 WHERE id = $1 RETURNING banned_until, ban_reason", [target.id, reason])
             : await pool.query("UPDATE users SET banned_until = NOW() + make_interval(mins => $2), ban_reason = $3 WHERE id = $1 RETURNING banned_until, ban_reason", [target.id, minutes, reason]);
         banCache.delete(target.id);
+        modLog(target.id, req.auth.username, "ban", (permanent ? "Permanent" : minutes + " min") + (reason ? " - " + reason : ""));
         const payload = banPayload({ until: result.rows[0].banned_until, reason });
         socketsOf(target.id).forEach(s => { s.emit("banned", payload); s.disconnect(true); });
         res.json({ success: true, bannedUntil: result.rows[0].banned_until, permanent });
@@ -906,6 +1335,7 @@ app.post("/api/admin/players/:id/admin", requireAdmin, async (req, res) => {
         if (!make && !isAdminName(req.auth.username)) return res.status(403).json({ success: false, message: "Only an owner can remove someone's admin role." });
         if (make && isBanned(await fetchUser(target.id))) return res.status(400).json({ success: false, message: "Lift their ban first." });
         await pool.query("UPDATE users SET is_admin = $2 WHERE id = $1", [target.id, make]);
+        modLog(target.id, req.auth.username, make ? "admin+" : "admin-", "");
         adminCache.delete(target.id);
         res.json({ success: true, admin: make });
     } catch (error) {
@@ -919,6 +1349,7 @@ app.post("/api/admin/players/:id/unban", requireAdmin, async (req, res) => {
         const target = await loadTarget(req, res); if (!target) return;
         await pool.query("UPDATE users SET banned_until = NULL, ban_reason = NULL WHERE id = $1", [target.id]);
         banCache.delete(target.id);
+        modLog(target.id, req.auth.username, "unban", "");
         res.json({ success: true });
     } catch (error) {
         console.error("Admin unban error:", error);
@@ -935,6 +1366,10 @@ app.post("/api/admin/players/:id/reset-stats", requireAdmin, async (req, res) =>
             `UPDATE users SET games_played = 0, games_completed = 0, total_score = 0, best_score = 0, total_notes_hit = 0,
                 battle_wins = 0, battle_losses = 0, updated_at = NOW() WHERE id = $1`, [target.id]);
         await pool.query("DELETE FROM level_completions WHERE user_id = $1", [target.id]);
+        await pool.query("UPDATE users SET bonus_stars = 0, elo = 1000, flags = 0 WHERE id = $1", [target.id]);
+        await pool.query("DELETE FROM level_records WHERE user_id = $1", [target.id]);
+        await pool.query("DELETE FROM daily_claims WHERE user_id = $1", [target.id]);
+        modLog(target.id, req.auth.username, "reset", "All statistics removed");
         res.json({ success: true });
     } catch (error) {
         console.error("Admin reset stats error:", error);
@@ -950,6 +1385,7 @@ app.post("/api/admin/players/:id/warn", requireAdmin, async (req, res) => {
         const message = String(req.body.message || "").trim().slice(0, 600);
         if (!message) return res.status(400).json({ success: false, message: "Write the warning text first." });
         await pool.query("UPDATE users SET pending_warning = $2, warning_at = NOW() WHERE id = $1", [target.id, message]);
+        modLog(target.id, req.auth.username, "warn", message);
         socketsOf(target.id).forEach(s => s.emit("warning", { message }));
         res.json({ success: true });
     } catch (error) {
@@ -980,6 +1416,7 @@ app.get("/api/players", async (req, res) => {
 app.get("/api/leaderboards", async (req, res) => {
     try {
         const orderMap = {
+            elo: "elo DESC, username ASC",
             points: "extreme_points DESC, stars DESC, username ASC",
             stars: "stars DESC, hardest_rank DESC, username ASC",
             difficulty: "hardest_rank DESC, stars DESC, username ASC",
@@ -1034,7 +1471,9 @@ io.use(async (socket, next) => {
     const taken = new Set([...lobby.values()].map(s => s.data.name));
     let unique = name, n = 2;
     while (taken.has(unique)) unique = name + " (" + (n++) + ")";
-    socket.data = { name: unique, userId, status: "lobby", matchId: null };
+    let elo = 1000;
+    if (userId) { try { elo = (await pool.query("SELECT elo FROM users WHERE id = $1", [userId])).rows[0].elo; } catch {} }
+    socket.data = { name: unique, userId, status: "lobby", matchId: null, elo };
     next();
 });
 
@@ -1124,13 +1563,33 @@ async function applyBattleStats(winnerUserId, loserUserId) {
     try {
         if (winnerUserId) await pool.query("UPDATE users SET battle_wins = battle_wins + 1 WHERE id = $1", [winnerUserId]);
         if (loserUserId) await pool.query("UPDATE users SET battle_losses = battle_losses + 1 WHERE id = $1", [loserUserId]);
+        if (winnerUserId && loserUserId) {   // ELO, K = 32 (only between two registered players)
+            const r = await pool.query("SELECT id, elo FROM users WHERE id = ANY($1::uuid[])", [[winnerUserId, loserUserId]]);
+            const w = r.rows.find(x => x.id === winnerUserId), l = r.rows.find(x => x.id === loserUserId);
+            if (w && l) {
+                const exp = 1 / (1 + Math.pow(10, (l.elo - w.elo) / 400));
+                const delta = Math.max(1, Math.round(32 * (1 - exp)));
+                await pool.query("UPDATE users SET elo = elo + $2 WHERE id = $1", [w.id, delta]);
+                await pool.query("UPDATE users SET elo = GREATEST(100, elo - $2) WHERE id = $1", [l.id, delta]);
+                return { delta, winner: w.id, loser: l.id };
+            }
+        }
     } catch (error) { console.error("Battle stats error:", error); }
+    return null;
+}
+
+// Spectators get a live scoreboard + progress bars for a battle.
+function specEmit(match, extra) {
+    const [a, b] = Object.values(match.players);
+    io.to("spec:" + match.id).emit("spec_state", Object.assign({ matchId: match.id, round: match.round, target: WIN_TARGET, level: match.level.name,
+        players: [{ name: a.name, rounds: a.rounds }, { name: b.name, rounds: b.rounds }] }, extra || {}));
 }
 
 function startRound(match) {
     if (match.done) return;
     match.started = true;
     match.roundDone = false;
+    specEmit(match, { roundStart: true });
     Object.values(match.players).forEach(p => {
         p.result = null;
         const opp = otherOf(match, p.sid);
@@ -1148,6 +1607,7 @@ function endRound(match, winnerSid) {
     if (winner && winner.rounds >= WIN_TARGET) return finishMatch(match, winnerSid);
     const finishedRound = match.round;
     match.round++;
+    specEmit(match, { roundWinner: winner ? winner.name : null });
     Object.values(match.players).forEach(p => {
         const opp = otherOf(match, p.sid);
         const s = lobby.get(p.sid);
@@ -1182,7 +1642,11 @@ function finishMatch(match, winnerSid, forfeitBy = null) {
     send(a, b);
     send(b, a);
     const w = match.players[winnerSid], l = otherOf(match, winnerSid);
-    applyBattleStats(w && w.userId, l && l.userId);
+    applyBattleStats(w && w.userId, l && l.userId).then(r => {
+        if (!r) return;
+        [[w, r.delta], [l, -r.delta]].forEach(([pl, d]) => { const sk = pl && lobby.get(pl.sid); if (sk) sk.emit("elo_change", { delta: d }); });
+    });
+    specEmit(match, { over: true, winner: w && w.name });
     // keep the match around briefly so a rematch can reuse the level
     setTimeout(() => matches.delete(match.id), 10 * 60 * 1000).unref();
 }
@@ -1200,9 +1664,12 @@ function forfeit(match, sid) {
 async function tryPairQueue() {
     while (queue.length >= 2) {
         const a = lobby.get(queue.shift());
-        const b = lobby.get(queue.shift());
-        if (!a || a.data.status !== "queue") { if (b && b.data.status === "queue") queue.unshift(b.id); continue; }
-        if (!b || b.data.status !== "queue") { queue.unshift(a.id); continue; }
+        if (!a || a.data.status !== "queue") continue;
+        // pair with the waiting player closest in ELO
+        let best = -1, bestDiff = Infinity;
+        queue.forEach((id, i) => { const c = lobby.get(id); if (c && c.data.status === "queue") { const d = Math.abs((c.data.elo || 1000) - (a.data.elo || 1000)); if (d < bestDiff) { bestDiff = d; best = i; } } });
+        if (best === -1) { queue.length = 0; continue; }
+        const b = lobby.get(queue.splice(best, 1)[0]);
         try {
             const level = await pickRandomLevel();
             if (!level) {
@@ -1223,6 +1690,36 @@ io.on("connection", socket => {
     schedulePresence();
 
     socket.on("presence_request", () => schedulePresence());
+
+    // --- spectating ---
+    socket.on("spectate_list", () => {
+        socket.emit("spectate_matches", [...matches.values()].filter(m => m.started && !m.done).slice(0, 20).map(m => {
+            const [a, b] = Object.values(m.players);
+            return { matchId: m.id, a: a.name, b: b.name, round: m.round, scoreA: a.rounds, scoreB: b.rounds, level: m.level.name };
+        }));
+    });
+    socket.on("spectate_join", payload => {
+        const m = matches.get(String(payload && payload.matchId));
+        if (!m || m.done || m.players[socket.id]) return socket.emit("spectate_failed", { message: "That match is over." });
+        socket.rooms.forEach(r => { if (String(r).startsWith("spec:")) socket.leave(r); });
+        socket.join("spec:" + m.id);
+        specEmit(m);
+    });
+    socket.on("spectate_leave", () => socket.rooms.forEach(r => { if (String(r).startsWith("spec:")) socket.leave(r); }));
+
+    // --- globe: see where other players are on the same level ---
+    socket.on("globe_join", payload => {
+        socket.rooms.forEach(r => { if (String(r).startsWith("globe:")) socket.leave(r); });
+        if (payload && isUuid(String(payload.levelId))) socket.join("globe:" + payload.levelId);
+    });
+    socket.on("globe_leave", () => socket.rooms.forEach(r => { if (String(r).startsWith("globe:")) socket.leave(r); }));
+    socket.on("globe_tap", payload => {
+        const now = Date.now();
+        if (socket.data.lastGlobe && now - socket.data.lastGlobe < 80) return;   // ~12 taps/s max
+        socket.data.lastGlobe = now;
+        if (!payload || !isUuid(String(payload.levelId))) return;
+        socket.to("globe:" + payload.levelId).volatile.emit("globe_tap", { name: socket.data.name, idx: clampInt(payload.idx, 0, 100000), lane: clampInt(payload.lane, 0, 3) });
+    });
 
     socket.on("queue_join", () => {
         if (socket.data.status !== "lobby") return;
@@ -1304,6 +1801,7 @@ io.on("connection", socket => {
         if (!me || match.done || match.roundDone) return;
         const opp = otherOf(match, socket.id);
         const s = opp && lobby.get(opp.sid);
+        io.to("spec:" + match.id).volatile.emit("spec_progress", { matchId: match.id, name: me.name, pct: clampInt(payload.pct, 0, 100), score: clampInt(payload.score, 0, 1e9) });
         if (s) s.volatile.emit("opp_progress", { pct: clampInt(payload.pct, 0, 100), score: clampInt(payload.score, 0, 1e9) });
     });
     socket.on("match_finish", payload => {
