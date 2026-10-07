@@ -350,6 +350,7 @@ function publicLevel(row, full = false) {
         bpm: meta.bpm || 120,
         gridOffset: meta.gridOffset || 0,
         strictMode: !!meta.strictMode,
+        lockCosmetics: !!meta.lockCosmetics,
         tags: Array.isArray(meta.tags) ? meta.tags : []
     };
     if (full) {
@@ -397,6 +398,7 @@ function sanitizeLevel(body) {
     if (Number.isFinite(Number(level.bpm))) meta.bpm = clampInt(level.bpm, 30, 300, 120);
     if (Number.isFinite(Number(level.gridOffset))) meta.gridOffset = Math.max(-5, Math.min(5, Number(level.gridOffset)));
     if (level.strictMode) meta.strictMode = true;
+    if (level.lockCosmetics) meta.lockCosmetics = true;
     if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
     return {
         name, notes, icon, meta,
