@@ -115,6 +115,8 @@ async function initializeDatabase() {
         )
     `);
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_icon TEXT");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS username_changed_at TIMESTAMPTZ");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS battle_points INTEGER NOT NULL DEFAULT 0");
     await pool.query(`
         CREATE TABLE IF NOT EXISTS levels (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -206,6 +208,9 @@ async function initializeDatabase() {
     await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS list_position INTEGER");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_list_idx ON levels (list_position) WHERE list_position IS NOT NULL");
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
+    await pool.query("INSERT INTO app_meta (key, value) VALUES ('max_bp', '500') ON CONFLICT DO NOTHING");
+    const bpSetting = await pool.query("SELECT value FROM app_meta WHERE key = 'max_bp' LIMIT 1");
+    MAX_BP = clampInt(bpSetting.rows[0] && bpSetting.rows[0].value, 1, 100000, 500);
     // v3 launch: everyone starts fresh (runs exactly once)
     const reset = await pool.query("INSERT INTO app_meta (key, value) VALUES ('v3_stats_reset', NOW()::text) ON CONFLICT DO NOTHING RETURNING key");
     if (reset.rows.length) {
@@ -227,6 +232,7 @@ function createToken(user) {
     return jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
 }
 
+let MAX_BP = 500;
 const DIFF_BY_RANK = [null, "Easy", "Normal", "Hard", "Insane", "Extreme"];
 // The level LIST (admin-ranked, #1 = hardest): beating the level at position p is worth EXTREME POINTS.
 //   #1 = 250 pts, each step down is worth 6% less, never below 5.
@@ -236,9 +242,9 @@ const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2
 // Everything about a player in one SELECT (alias the table as "u").
 // stars / difficulty beaten come from RATED (admin-featured) levels you completed;
 // creator points = how many of YOUR levels are rated.
-const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.games_played, u.games_completed,
+const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.username_changed_at, u.created_at, u.games_played, u.games_completed,
     u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses,
-    u.banned_until, u.ban_reason, u.pending_warning, u.is_admin,
+    u.banned_until, u.ban_reason, u.pending_warning, u.is_admin, u.battle_points,
     (COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0) + u.bonus_stars)::int AS stars, u.elo, u.cosmetics, u.flags,
     (SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured)::int AS creator_points,
     COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0)::int AS extreme_points,
@@ -289,6 +295,9 @@ function publicUser(user, includeEmail = true) {
     const out = {
         id: user.id,
         username: user.username,
+        usernameNextChangeAt: user.username_changed_at ? new Date(new Date(user.username_changed_at).getTime() + 86400000).toISOString() : null,
+        battlePoints: Math.max(0, Math.min(MAX_BP, Number(user.battle_points || 0))),
+        maxBP: MAX_BP,
         email: includeEmail ? user.email : undefined,
         createdAt: user.created_at,
         profileIcon: user.profile_icon || null,
@@ -356,6 +365,8 @@ function publicLevel(row, full = false) {
     if (full) {
         level.data = row.level_data || [];
         level.effects = row.effects || [];
+        if (meta.audioData) { level.audioData = meta.audioData; level.audioName = meta.audioName || null; level.audioType = meta.audioType || null; level.hasAudio = true; }
+        level.startPositions = Array.isArray(meta.startPositions) ? meta.startPositions : [];
     }
     return level;
 }
@@ -400,6 +411,12 @@ function sanitizeLevel(body) {
     if (level.strictMode) meta.strictMode = true;
     if (level.lockCosmetics) meta.lockCosmetics = true;
     if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
+    if (Array.isArray(level.startPositions)) meta.startPositions = level.startPositions.map(Number).filter(Number.isFinite).map(v => Math.max(0, Math.min(3600, v))).slice(0, 50);
+    if (level.audioData) {
+        const audio = String(level.audioData);
+        if (!/^data:audio\\/[a-z0-9.+-]+;base64,/i.test(audio) || audio.length > 7000000) return { error: "Song is too large to publish. Use a shorter song under about 5MB." };
+        meta.audioData = audio; meta.audioName = String(level.audioName || "level-audio").slice(0, 120); meta.audioType = String(level.audioType || "audio/*").slice(0, 80);
+    }
     return {
         name, notes, icon, meta,
         effects: sanitizeEffects(level.effects),
@@ -552,13 +569,30 @@ app.post("/api/auth/warning/ack", authenticate, async (req, res) => {
 
 app.patch("/api/profile", authenticate, async (req, res) => {
     try {
-        const icon = req.body.profileIcon ? String(req.body.profileIcon) : null;
-        if (icon && (!icon.startsWith("data:image/") || icon.length > 400000)) return res.status(400).json({ success: false, message: "Profile icon is too large" });
-        const result = await pool.query("UPDATE users SET profile_icon = $2, updated_at = NOW() WHERE id = $1 RETURNING id", [req.auth.userId, icon]);
+        const icon = req.body.profileIcon !== undefined ? (req.body.profileIcon ? String(req.body.profileIcon) : null) : undefined;
+        if (icon !== undefined && icon && (!icon.startsWith("data:image/") || icon.length > 400000)) return res.status(400).json({ success: false, message: "Profile icon is too large" });
+        const username = req.body.username !== undefined ? String(req.body.username || "").trim() : null;
+        if (username !== null) {
+            if (!validUsername(username)) return res.status(400).json({ success: false, message: "Username must be 3-20 characters: letters, numbers, underscores" });
+            const current = await pool.query("SELECT username, username_changed_at FROM users WHERE id = $1", [req.auth.userId]);
+            if (!current.rows.length) return res.status(404).json({ success: false, message: "Account not found" });
+            if (current.rows[0].username.toLowerCase() !== username.toLowerCase()) {
+                const last = current.rows[0].username_changed_at ? new Date(current.rows[0].username_changed_at).getTime() : 0;
+                if (last && Date.now() - last < 86400000) return res.status(429).json({ success: false, message: "You can change your username once every 24 hours." });
+                const taken = await pool.query("SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2 LIMIT 1", [username, req.auth.userId]);
+                if (taken.rows.length) return res.status(409).json({ success: false, message: "That username is already taken" });
+            }
+        }
+        const sets = [], values = [req.auth.userId]; let n = 2;
+        if (icon !== undefined) { sets.push("profile_icon = $" + n++); values.push(icon); }
+        if (username !== null) { sets.push("username = $" + n++); values.push(username); sets.push("username_changed_at = NOW()"); }
+        sets.push("updated_at = NOW()");
+        const result = await pool.query("UPDATE users SET " + sets.join(", ") + " WHERE id = $1 RETURNING id", values);
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Account not found" });
         res.json({ success: true, user: publicUser(await fetchUser(req.auth.userId)) });
     } catch (error) {
         console.error("Profile update error:", error);
+        if (error.code === "23505") return res.status(409).json({ success: false, message: "That username is already taken" });
         res.status(500).json({ success: false, message: "Could not update profile" });
     }
 });
@@ -977,6 +1011,18 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not roll back" }); }
 });
 
+app.delete("/api/levels/:id/versions/:versionId", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false });
+        const id = clampInt(req.params.versionId, 1, 9e15, 0);
+        const own = await pool.query("SELECT 1 FROM levels WHERE id = $1 AND author_id = $2", [req.params.id, req.auth.userId]);
+        if (!own.rows.length) return res.status(404).json({ success: false, message: "Level not found or you do not own it" });
+        const d = await pool.query("DELETE FROM level_versions WHERE id = $1 AND level_id = $2 RETURNING id", [id, req.params.id]);
+        if (!d.rows.length) return res.status(404).json({ success: false, message: "Version not found" });
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not delete version" }); }
+});
+
 // Update one of YOUR published levels in place (ratings, plays, rated status and completions are kept).
 // Rated levels also ping the admin so they can re-check the change.
 app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000), async (req, res) => {
@@ -1141,7 +1187,7 @@ app.get("/api/admin/overview", requireAdmin, async (req, res) => {
             pool.query("SELECT COUNT(*)::int AS n FROM users WHERE banned_until > NOW()")
         ]);
         res.json({ success: true, users: users.rows[0].n, levels: levels.rows[0].n, rated: levels.rows[0].rated, featured: levels.rows[0].rated,
-            plays: Number(plays.rows[0].n), onlineNow: lobby.size, unreadNotifications: notes.rows[0].n, banned: banned.rows[0].n });
+            plays: Number(plays.rows[0].n), onlineNow: lobby.size, unreadNotifications: notes.rows[0].n, banned: banned.rows[0].n, maxBP: MAX_BP });
     } catch (error) {
         console.error("Admin overview error:", error);
         res.status(500).json({ success: false, message: "Could not load overview" });
@@ -1176,6 +1222,15 @@ app.post("/api/admin/notifications/read", requireAdmin, async (req, res) => {
     }
 });
 
+app.patch("/api/admin/settings", requireAdmin, async (req, res) => {
+    try {
+        MAX_BP = clampInt(req.body.maxBP, 1, 100000, MAX_BP);
+        await pool.query("INSERT INTO app_meta (key, value) VALUES ('max_bp', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(MAX_BP)]);
+        await pool.query("UPDATE users SET battle_points = LEAST(battle_points, $1)", [MAX_BP]);
+        res.json({ success: true, maxBP: MAX_BP });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not update admin settings" }); }
+});
+
 // --- levels ---
 app.get("/api/admin/levels", requireAdmin, async (req, res) => {
     try {
@@ -1189,6 +1244,16 @@ app.get("/api/admin/levels", requireAdmin, async (req, res) => {
         console.error("Admin levels error:", error);
         res.status(500).json({ success: false, message: "Could not load admin levels" });
     }
+});
+
+app.delete("/api/admin/levels/:id/rating", requireAdmin, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const r = await pool.query("UPDATE levels SET featured = FALSE, rated_stars = 0, updated_at = NOW() WHERE id = $1 RETURNING " + LEVEL_SUMMARY_COLUMNS, [req.params.id]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+        await pool.query("UPDATE admin_notifications SET read = TRUE WHERE level_id = $1", [req.params.id]);
+        res.json({ success: true, level: publicLevel(r.rows[0]) });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not remove verification" }); }
 });
 
 // Rate a level: rated=true makes it a rated (featured) level worth `stars` stars with the given difficulty.
@@ -1304,6 +1369,24 @@ app.get("/api/admin/players/:id/history", requireAdmin, async (req, res) => {
             pool.query("SELECT flags FROM users WHERE id = $1", [target.id])]);
         res.json({ success: true, reports: reps.rows[0].n, flags: flags.rows[0].flags, history: log.rows.map(h => ({ admin: h.admin_name, action: h.action, detail: h.detail, at: h.created_at })) });
     } catch (error) { res.status(500).json({ success: false, message: "Could not load history" }); }
+});
+
+app.post("/api/admin/players/:id/bp", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const value = clampInt(req.body.value, 0, MAX_BP, 0);
+        await pool.query("UPDATE users SET battle_points = $2, updated_at = NOW() WHERE id = $1", [target.id, value]);
+        modLog(target.id, req.auth.username, "set_bp", String(value));
+        res.json({ success: true, battlePoints: value, maxBP: MAX_BP });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not update battle points" }); }
+});
+app.post("/api/admin/players/:id/reset-username-cooldown", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        await pool.query("UPDATE users SET username_changed_at = NULL WHERE id = $1", [target.id]);
+        modLog(target.id, req.auth.username, "reset_username_cooldown", "");
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not reset username cooldown" }); }
 });
 
 app.post("/api/admin/players/:id/ban", requireAdmin, async (req, res) => {
