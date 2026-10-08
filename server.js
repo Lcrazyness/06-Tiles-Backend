@@ -1646,8 +1646,8 @@ function cancelMatch(match, message) {
 
 async function applyBattleStats(winnerUserId, loserUserId) {
     try {
-        if (winnerUserId) await pool.query("UPDATE users SET battle_wins = battle_wins + 1 WHERE id = $1", [winnerUserId]);
-        if (loserUserId) await pool.query("UPDATE users SET battle_losses = battle_losses + 1 WHERE id = $1", [loserUserId]);
+        if (winnerUserId) await pool.query("UPDATE users SET battle_wins = battle_wins + 1, battle_points = LEAST($2, battle_points + 10) WHERE id = $1", [winnerUserId, MAX_BP]);
+        if (loserUserId) await pool.query("UPDATE users SET battle_losses = battle_losses + 1, battle_points = LEAST($2, battle_points + 3) WHERE id = $1", [loserUserId, MAX_BP]);
         if (winnerUserId && loserUserId) {   // ELO, K = 32 (only between two registered players)
             const r = await pool.query("SELECT id, elo FROM users WHERE id = ANY($1::uuid[])", [[winnerUserId, loserUserId]]);
             const w = r.rows.find(x => x.id === winnerUserId), l = r.rows.find(x => x.id === loserUserId);
