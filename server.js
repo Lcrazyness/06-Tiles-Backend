@@ -414,7 +414,7 @@ function sanitizeLevel(body) {
     if (Array.isArray(level.startPositions)) meta.startPositions = level.startPositions.map(Number).filter(Number.isFinite).map(v => Math.max(0, Math.min(3600, v))).slice(0, 50);
     if (level.audioData) {
         const audio = String(level.audioData);
-        if (!/^data:audio\\/[a-z0-9.+-]+;base64,/i.test(audio) || audio.length > 7000000) return { error: "Song is too large to publish. Use a shorter song under about 5MB." };
+        if (!/^data:audio\/[a-z0-9.+-]+;base64,/i.test(audio) || audio.length > 7000000) return { error: "Song is too large to publish. Use a shorter song under about 5MB." };
         meta.audioData = audio; meta.audioName = String(level.audioName || "level-audio").slice(0, 120); meta.audioType = String(level.audioType || "audio/*").slice(0, 80);
     }
     return {
