@@ -1327,7 +1327,7 @@ function adminPlayer(u) {
         isAdmin: isAdminRow(u), owner: isAdminName(u.username), banned: isBanned(u), bannedUntil: isBanned(u) ? u.banned_until : null,
         permanent: isBanned(u) && new Date(u.banned_until).getFullYear() >= 9000, banReason: isBanned(u) ? (u.ban_reason || "") : "",
         pendingWarning: u.pending_warning || null, levelCount: u.level_count || 0, difficultyCounts: u.difficulty_counts || {},
-        stars: u.stars || 0, creatorPoints: u.creator_points || 0, extremePoints: u.extreme_points || 0,
+        stars: u.stars || 0, creatorPoints: u.creator_points || 0, extremePoints: u.extreme_points || 0, battlePoints: Math.max(0, Math.min(MAX_BP, Number(u.battle_points || 0))),
         hardestDifficulty: DIFF_BY_RANK[u.hardest_rank || 0] || null,
         statistics: {
             gamesPlayed: u.games_played, gamesCompleted: u.games_completed, totalScore: Number(u.total_score), bestScore: Number(u.best_score),
