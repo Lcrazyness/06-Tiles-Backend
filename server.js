@@ -572,11 +572,13 @@ app.patch("/api/profile", authenticate, async (req, res) => {
         const icon = req.body.profileIcon !== undefined ? (req.body.profileIcon ? String(req.body.profileIcon) : null) : undefined;
         if (icon !== undefined && icon && (!icon.startsWith("data:image/") || icon.length > 400000)) return res.status(400).json({ success: false, message: "Profile icon is too large" });
         const username = req.body.username !== undefined ? String(req.body.username || "").trim() : null;
+        let usernameChanged = false;
         if (username !== null) {
             if (!validUsername(username)) return res.status(400).json({ success: false, message: "Username must be 3-20 characters: letters, numbers, underscores" });
             const current = await pool.query("SELECT username, username_changed_at FROM users WHERE id = $1", [req.auth.userId]);
             if (!current.rows.length) return res.status(404).json({ success: false, message: "Account not found" });
-            if (current.rows[0].username.toLowerCase() !== username.toLowerCase()) {
+            usernameChanged = current.rows[0].username.toLowerCase() !== username.toLowerCase();
+            if (usernameChanged) {
                 const last = current.rows[0].username_changed_at ? new Date(current.rows[0].username_changed_at).getTime() : 0;
                 if (last && Date.now() - last < 86400000) return res.status(429).json({ success: false, message: "You can change your username once every 24 hours." });
                 const taken = await pool.query("SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND id <> $2 LIMIT 1", [username, req.auth.userId]);
@@ -585,7 +587,7 @@ app.patch("/api/profile", authenticate, async (req, res) => {
         }
         const sets = [], values = [req.auth.userId]; let n = 2;
         if (icon !== undefined) { sets.push("profile_icon = $" + n++); values.push(icon); }
-        if (username !== null) { sets.push("username = $" + n++); values.push(username); sets.push("username_changed_at = NOW()"); }
+        if (usernameChanged) { sets.push("username = $" + n++); values.push(username); sets.push("username_changed_at = NOW()"); }
         sets.push("updated_at = NOW()");
         const result = await pool.query("UPDATE users SET " + sets.join(", ") + " WHERE id = $1 RETURNING id", values);
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Account not found" });
