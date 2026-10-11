@@ -40,7 +40,7 @@ const pool = new Pool({
 });
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "16mb" }));
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -209,7 +209,18 @@ async function initializeDatabase() {
     await pool.query("ALTER TABLE reports ADD COLUMN IF NOT EXISTS handled BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query(`CREATE TABLE IF NOT EXISTS admin_log (id BIGSERIAL PRIMARY KEY, admin_name VARCHAR(30) NOT NULL, action VARCHAR(30) NOT NULL,
         target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS decor JSONB");
+    await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS list_points INTEGER");
+    await pool.query(`CREATE TABLE IF NOT EXISTS songs (id BIGSERIAL PRIMARY KEY, name VARCHAR(80) NOT NULL, artist VARCHAR(80) NOT NULL DEFAULT '', bpm INTEGER, size INTEGER NOT NULL DEFAULT 0,
+        data TEXT NOT NULL, added_by VARCHAR(30) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS news (id BIGSERIAL PRIMARY KEY, title VARCHAR(120) NOT NULL, body TEXT NOT NULL DEFAULT '', image TEXT, author VARCHAR(30) NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS cloud_levels (id BIGSERIAL PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL,
+        local_id VARCHAR(60) NOT NULL, name VARCHAR(80) NOT NULL, data JSONB NOT NULL, tile_count INTEGER NOT NULL DEFAULT 0, published_id UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (owner_id, local_id))`);
     await loadAppSettings();
+    await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
+    await pool.query("INSERT INTO app_meta (key, value) VALUES ('list_max', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(appSettings.listMaxPoints)]);
     await pool.query("ALTER TABLE levels ADD COLUMN IF NOT EXISTS list_position INTEGER");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_list_idx ON levels (list_position) WHERE list_position IS NOT NULL");
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
@@ -237,7 +248,7 @@ function createToken(user) {
 const DIFF_BY_RANK = [null, "Easy", "Normal", "Hard", "Insane", "Extreme"];
 // The level LIST (admin-ranked, #1 = hardest): beating the level at position p is worth EXTREME POINTS.
 //   #1 = 250 pts, each step down is worth 6% less, never below 5.
-const LIST_POINTS_SQL = "GREATEST(5, CEIL(250 * POWER(0.94, l.list_position - 1)))::int";
+const LIST_POINTS_SQL = "COALESCE(l.list_points, GREATEST(5, CEIL((SELECT COALESCE(MAX(value::numeric), 250) FROM app_meta WHERE key = 'list_max') * POWER(0.94, l.list_position - 1)))::int)";
 const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Hard' THEN 3 WHEN 'Insane' THEN 4 WHEN 'Extreme' THEN 5 ELSE 0 END";
 
 // Everything about a player in one SELECT (alias the table as "u").
@@ -327,11 +338,11 @@ function publicUser(user, includeEmail = true) {
 
 // Summaries leave out the heavy note data / effect images so Browse stays fast.
 const LEVEL_SUMMARY_COLUMNS = `id, name, author_id, author, icon, lives, fps, audio_offset, disable_holds, difficulty,
-    plays, rating_total, rating_count, featured, rated_stars, list_position, created_at, meta,
+    plays, rating_total, rating_count, featured, rated_stars, list_position, list_points, created_at, meta,
     CASE WHEN jsonb_typeof(level_data) = 'array' THEN jsonb_array_length(level_data) ELSE 0 END AS tile_count, (audio IS NOT NULL) AS has_audio`;
 
 // ---- global settings the admins can change (stored as JSON in app_meta) ----
-const DEFAULT_SETTINGS = { maxBpm: 500, announcement: "", dailyBonusStars: 3, commentsOpen: true, registrationOpen: true, dailyOverride: null };
+const DEFAULT_SETTINGS = { maxBpm: 500, announcement: "", dailyBonusStars: 3, commentsOpen: true, registrationOpen: true, dailyOverride: null, listMaxPoints: 250 };
 let appSettings = Object.assign({}, DEFAULT_SETTINGS);
 async function loadAppSettings() {
     try {
@@ -341,7 +352,10 @@ async function loadAppSettings() {
 }
 async function saveAppSettings() { await pool.query("INSERT INTO app_meta (key, value) VALUES ('settings', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify(appSettings)]); }
 function adminLog(adminName, action, target, detail) { pool.query("INSERT INTO admin_log (admin_name, action, target, detail) VALUES ($1,$2,$3,$4)", [adminName, action, String(target || "").slice(0, 120), String(detail || "").slice(0, 300)]).catch(() => {}); }
-async function setLevelAudio(id, audio) { await pool.query("UPDATE levels SET audio = $2 WHERE id = $1", [id, audio || null]); }
+async function setLevelAudio(id, audio, decor) {
+    await pool.query("UPDATE levels SET audio = $2 WHERE id = $1", [id, audio || null]);
+    if (decor !== undefined) await pool.query("UPDATE levels SET decor = $2::jsonb WHERE id = $1", [id, decor ? JSON.stringify(decor) : null]);
+}
 
 function publicLevel(row, full = false) {
     const meta = row.meta || {};
@@ -362,7 +376,10 @@ function publicLevel(row, full = false) {
         featured: !!row.featured,
         ratedStars: row.featured ? (row.rated_stars || 0) : 0,
         listPosition: row.list_position || null,
-        listPoints: row.list_position ? Math.max(5, Math.ceil(250 * Math.pow(0.94, row.list_position - 1))) : 0,
+        listPoints: row.list_position ? (row.list_points || Math.max(5, Math.ceil(appSettings.listMaxPoints * Math.pow(0.94, row.list_position - 1)))) : 0,
+        description: meta.description || "",
+        thumb: meta.thumb || null,
+        songId: meta.songId || null,
         createdAt: row.created_at,
         tileCount: row.tile_count !== undefined ? Number(row.tile_count) : (row.level_data || []).length,
         backgroundColor: meta.backgroundColor || "#202738",
@@ -379,6 +396,7 @@ function publicLevel(row, full = false) {
         level.audio = row.audio || null;
         level.data = row.level_data || [];
         level.effects = row.effects || [];
+        level.decor = row.decor || null;
     }
     return level;
 }
@@ -391,7 +409,10 @@ function sanitizeNotes(data) {
         const time = Number(n && n.time);
         if (!Number.isInteger(lane) || lane < 0 || lane > 3 || !Number.isFinite(time) || time < 0 || time > 3600) return null;
         const hold = !!n.isHold;
-        out.push({ lane, time: Math.round(time * 1000) / 1000, isHold: hold, holdDuration: hold ? Math.max(0, Math.min(30, Number(n.holdDuration) || 0)) : 0 });
+        const t = { lane, time: Math.round(time * 1000) / 1000, isHold: hold, holdDuration: hold ? Math.max(0, Math.min(30, Number(n.holdDuration) || 0)) : 0 };
+        if (Number.isInteger(n.preset) && n.preset >= 0 && n.preset < 40) t.preset = n.preset;
+        if (Array.isArray(n.groups)) t.groups = [...new Set(n.groups.map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999))].slice(0, 6);
+        out.push(t);
     }
     out.sort((a, b) => a.time - b.time || a.lane - b.lane);
     return out;
@@ -405,7 +426,41 @@ function sanitizeEffects(effects) {
         .filter(e => e && typeof e === "object" && typeof e.type === "string" && Number.isFinite(Number(e.time)))
         .filter(e => !e.src || (typeof e.src === "string" && e.src.length < 3000000))
         .filter(e => e.url === undefined || (typeof e.url === "string" && /^https:\/\/[^\s"'<>]{4,490}$/i.test(e.url)))
-        .slice(0, 600);
+        .slice(0, 1500);
+}
+
+// decor: { objects:[...], images:{id:dataURL}, presets:[...] } - kept in its own column so lists stay light
+function sanitizeDecor(d) {
+    if (!d || typeof d !== "object") return null;
+    const num = (v, lo, hi, def) => { v = Number(v); return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : def; };
+    const str = (v, n) => String(v === undefined || v === null ? "" : v).slice(0, n);
+    const hex = (v, def) => /^#[0-9a-f]{6}$/i.test(str(v, 9)) ? v : def;
+    const images = {};
+    let imgBytes = 0;
+    if (d.images && typeof d.images === "object") {
+        for (const k of Object.keys(d.images).slice(0, 12)) {
+            const v = d.images[k];
+            if (typeof v === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(v) && v.length <= 600000 && imgBytes + v.length <= 2500000) { images[str(k, 20)] = v; imgBytes += v.length; }
+        }
+    }
+    const objects = (Array.isArray(d.objects) ? d.objects : []).slice(0, 1500).filter(o => o && typeof o === "object").map(o => ({
+        id: Math.floor(num(o.id, 1, 1e9, 1)), kind: ["square", "triangle", "circle", "glow", "image", "text"].includes(o.kind) ? o.kind : "square",
+        time: num(o.time, 0, 3600, 0), x: num(o.x, -3000, 3000, 180), y: num(o.y, -3000, 3000, 320),
+        w: num(o.w, 1, 4000, 60), h: num(o.h, 1, 4000, 60), rot: num(o.rot, -3600, 3600, 0), alpha: num(o.alpha, 0, 1, 1),
+        color: hex(o.color, "#ffffff"), color2: o.color2 ? hex(o.color2, "") : "",
+        layer: o.layer === "fg" ? "fg" : "bg", z: Math.floor(num(o.z, -50, 50, 0)), add: !!o.add,
+        groups: (Array.isArray(o.groups) ? o.groups : []).map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999).slice(0, 6),
+        img: str(o.img, 20), text: str(o.text, 80), font: str(o.font, 40), size: num(o.size, 6, 400, 40), bold: !!o.bold,
+        hidden: !!o.hidden, locked: !!o.locked, name: str(o.name, 30), outline: !!o.outline
+    }));
+    const presets = (Array.isArray(d.presets) ? d.presets : []).slice(0, 40).map(p => {
+        p = p && typeof p === "object" ? p : {};
+        return { name: str(p.name, 24), style: ["flat", "gradient", "glass", "neon", "outline", "pixel"].includes(p.style) ? p.style : "flat",
+            color: hex(p.color, "#ffffff"), color2: hex(p.color2, "#888888"), radius: num(p.radius, 0, 60, 8), border: num(p.border, 0, 12, 0), borderColor: hex(p.borderColor, "#ffffff"),
+            glow: num(p.glow, 0, 60, 0), alpha: num(p.alpha, 0.05, 1, 1), holdColor: p.holdColor ? hex(p.holdColor, "") : "", z: Math.floor(num(p.z, -10, 10, 0)),
+            wide: num(p.wide, 0.3, 1, 1), tall: num(p.tall, 0.3, 1.4, 1) };
+    });
+    return { objects, images, presets };
 }
 
 function sanitizeLevel(body) {
@@ -424,9 +479,12 @@ function sanitizeLevel(body) {
     if (level.lockCosmetics) meta.lockCosmetics = true;
     if (Array.isArray(level.startPositions)) meta.startPositions = [...new Set(level.startPositions.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n <= 3600).map(n => Math.round(n * 1000) / 1000))].sort((a, b) => a - b).slice(0, 20);
     if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
+    if (typeof level.description === "string" && level.description.trim()) meta.description = level.description.trim().slice(0, 400);
+    if (typeof level.thumb === "string" && /^data:image\/(jpeg|png|webp);base64,/.test(level.thumb) && level.thumb.length <= 60000) meta.thumb = level.thumb;
+    if (Number.isInteger(Number(level.songId)) && Number(level.songId) > 0) meta.songId = Number(level.songId);
     return {
-        name, notes, icon, meta,
-        audio: typeof level.audio === "string" && /^data:audio\//.test(level.audio) && level.audio.length <= 6500000 ? level.audio : null,
+        name, notes, icon, meta, decor: sanitizeDecor(level.decor),
+        audio: typeof level.audio === "string" && /^data:audio\//.test(level.audio) && level.audio.length <= 8600000 ? level.audio : null,
         effects: sanitizeEffects(level.effects),
         lives: clampInt(level.lives, 1, 10, 3),
         fps: clampInt(level.fps, 10, 240, 60),
@@ -909,7 +967,7 @@ app.post("/api/levels", authenticate, rateLimit("publish", 20, 60 * 60 * 1000), 
             [clean.name, req.auth.userId, req.auth.username, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects),
              clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)]
         );
-        await setLevelAudio(result.rows[0].id, clean.audio);
+        await setLevelAudio(result.rows[0].id, clean.audio, clean.decor);
         res.status(201).json({ success: true, level: publicLevel(result.rows[0]) });
     } catch (error) {
         console.error("Level publish error:", error);
@@ -1026,7 +1084,7 @@ app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000
         );
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found or you do not own it" });
         const row = result.rows[0];
-        await setLevelAudio(row.id, clean.audio);
+        await setLevelAudio(row.id, clean.audio, clean.decor);
         if (row.featured || row.list_position) {
             await pool.query(
                 `INSERT INTO admin_notifications (type, level_id, user_id, message) VALUES ('level_updated', $1, $2, $3)
@@ -1140,7 +1198,7 @@ app.post("/api/drafts/:id/publish", authenticate, async (req, res) => {
                 [clean.name, d.owner_id, d.owner, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
             await pool.query("UPDATE drafts SET level_id = $2 WHERE id = $1", [d.id, row.id]);
         }
-        await setLevelAudio(row.id, clean.audio);
+        await setLevelAudio(row.id, clean.audio, clean.decor);
         res.json({ success: true, level: publicLevel(row) });
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not publish" }); }
 });
@@ -1149,11 +1207,201 @@ app.delete("/api/drafts/:id", authenticate, async (req, res) => {
     catch (error) { res.status(500).json({ success: false, message: "Could not delete" }); }
 });
 
+
+// ---------------------------------------------------------------------------
+// song library (admins upload free songs, everyone can pick them in the editor)
+// ---------------------------------------------------------------------------
+app.get("/api/songs", async (req, res) => {
+    try {
+        const r = await pool.query("SELECT id, name, artist, bpm, size, added_by FROM songs ORDER BY name ASC LIMIT 300");
+        res.json({ success: true, songs: r.rows.map(x => ({ id: Number(x.id), name: x.name, artist: x.artist, bpm: x.bpm, size: x.size, addedBy: x.added_by })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load songs" }); }
+});
+app.get("/api/songs/:id/audio", async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isInteger(id)) return res.status(404).end();
+        const r = await pool.query("SELECT data FROM songs WHERE id = $1", [id]);
+        if (!r.rows.length) return res.status(404).end();
+        const m = /^data:([a-z0-9\/+.-]+);base64,([\s\S]*)$/i.exec(r.rows[0].data);
+        if (!m) return res.status(404).end();
+        const buf = Buffer.from(m[2], "base64");
+        res.set({ "Content-Type": m[1], "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=86400", "Access-Control-Allow-Origin": "*" });
+        const rng = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
+        if (rng) {
+            const start = rng[1] ? parseInt(rng[1], 10) : 0, end = rng[2] ? Math.min(parseInt(rng[2], 10), buf.length - 1) : buf.length - 1;
+            if (start > end || start >= buf.length) return res.status(416).set("Content-Range", "bytes */" + buf.length).end();
+            res.status(206).set({ "Content-Range": `bytes ${start}-${end}/${buf.length}`, "Content-Length": end - start + 1 });
+            return res.end(buf.subarray(start, end + 1));
+        }
+        res.set("Content-Length", buf.length);
+        res.end(buf);
+    } catch (e) { console.error(e); res.status(500).end(); }
+});
+app.post("/api/admin/songs", requireAdmin, async (req, res) => {
+    try {
+        const name = String(req.body.name || "").trim().slice(0, 80);
+        const data = String(req.body.data || "");
+        if (!name) return res.status(400).json({ success: false, message: "Give the song a name." });
+        if (!/^data:audio\//.test(data) || data.length > 12000000) return res.status(400).json({ success: false, message: "Upload an audio file under about 8 MB." });
+        const bpm = req.body.bpm ? clampInt(req.body.bpm, 30, 1000, null) : null;
+        const r = await pool.query("INSERT INTO songs (name, artist, bpm, size, data, added_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id", [name, String(req.body.artist || "").trim().slice(0, 80), bpm, data.length, data, req.auth.username]);
+        adminLog(req.auth.username, "song_add", name, "");
+        res.status(201).json({ success: true, id: Number(r.rows[0].id) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not add the song" }); }
+});
+app.delete("/api/admin/songs/:id", requireAdmin, async (req, res) => {
+    try { await pool.query("DELETE FROM songs WHERE id = $1", [Number(req.params.id) || 0]); adminLog(req.auth.username, "song_del", req.params.id, ""); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ success: false, message: "Could not delete the song" }); }
+});
+
+// ---------------------------------------------------------------------------
+// announcements / update logs (admins post, everyone reads)
+// ---------------------------------------------------------------------------
+app.get("/api/news", async (req, res) => {
+    try {
+        const r = await pool.query("SELECT id, title, body, image, author, created_at FROM news ORDER BY created_at DESC LIMIT 40");
+        res.json({ success: true, news: r.rows.map(n => ({ id: Number(n.id), title: n.title, body: n.body, image: n.image, author: n.author, createdAt: n.created_at })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load announcements" }); }
+});
+function cleanNews(b) {
+    const title = String(b.title || "").trim().slice(0, 120), body = String(b.body || "").slice(0, 5000);
+    const image = typeof b.image === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(b.image) && b.image.length <= 1500000 ? b.image : null;
+    return { title, body, image };
+}
+app.post("/api/admin/news", requireAdmin, async (req, res) => {
+    try {
+        const n = cleanNews(req.body);
+        if (!n.title) return res.status(400).json({ success: false, message: "Add a title." });
+        const r = await pool.query("INSERT INTO news (title, body, image, author) VALUES ($1,$2,$3,$4) RETURNING id", [n.title, n.body, n.image, req.auth.username]);
+        adminLog(req.auth.username, "news_post", n.title, "");
+        io.emit("news_posted", { id: Number(r.rows[0].id), title: n.title });
+        res.status(201).json({ success: true, id: Number(r.rows[0].id) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not post" }); }
+});
+app.put("/api/admin/news/:id", requireAdmin, async (req, res) => {
+    try {
+        const n = cleanNews(req.body);
+        if (!n.title) return res.status(400).json({ success: false, message: "Add a title." });
+        const id = Number(req.params.id) || 0;
+        if (req.body.keepImage === true) await pool.query("UPDATE news SET title=$2, body=$3 WHERE id=$1", [id, n.title, n.body]);
+        else await pool.query("UPDATE news SET title=$2, body=$3, image=$4 WHERE id=$1", [id, n.title, n.body, n.image]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not save" }); }
+});
+app.delete("/api/admin/news/:id", requireAdmin, async (req, res) => {
+    try { await pool.query("DELETE FROM news WHERE id = $1", [Number(req.params.id) || 0]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ success: false, message: "Could not delete" }); }
+});
+
+// ---------------------------------------------------------------------------
+// cloud copies of "My Levels" so admins can find and publish unpublished levels
+// ---------------------------------------------------------------------------
+app.put("/api/sync/levels/:localId", authenticate, rateLimit("sync", 240, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const localId = String(req.params.localId).slice(0, 60);
+        const body = Object.assign({}, req.body, { audio: null });   // music stays on the player's device
+        const clean = sanitizeLevel(body);
+        if (clean.error) return res.json({ success: true, skipped: true });
+        const pub = req.body.onlineId && isUuid(req.body.onlineId) ? req.body.onlineId : null;
+        await pool.query(`INSERT INTO cloud_levels (owner_id, owner, local_id, name, data, tile_count, published_id, updated_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,NOW())
+            ON CONFLICT (owner_id, local_id) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data, tile_count = EXCLUDED.tile_count, published_id = EXCLUDED.published_id, owner = EXCLUDED.owner, updated_at = NOW()`,
+            [req.auth.userId, req.auth.username, localId, clean.name, JSON.stringify(body), clean.notes.length, pub]);
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.delete("/api/sync/levels/:localId", authenticate, async (req, res) => {
+    try { await pool.query("DELETE FROM cloud_levels WHERE owner_id = $1 AND local_id = $2", [req.auth.userId, String(req.params.localId).slice(0, 60)]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ success: false }); }
+});
+app.get("/api/admin/unpublished", requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT id, owner_id, owner, local_id, name, tile_count, updated_at FROM cloud_levels WHERE published_id IS NULL ORDER BY updated_at DESC LIMIT 200");
+        res.json({ success: true, levels: r.rows.map(x => ({ id: Number(x.id), ownerId: x.owner_id, owner: x.owner, name: x.name, tileCount: x.tile_count, updatedAt: x.updated_at })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load unpublished levels" }); }
+});
+app.get("/api/admin/unpublished/:id", requireAdmin, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT * FROM cloud_levels WHERE id = $1", [Number(req.params.id) || 0]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
+        res.json({ success: true, owner: r.rows[0].owner, level: r.rows[0].data });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not open it" }); }
+});
+app.post("/api/admin/unpublished/:id/publish", requireAdmin, async (req, res) => {
+    try {
+        const c = (await pool.query("SELECT * FROM cloud_levels WHERE id = $1", [Number(req.params.id) || 0])).rows[0];
+        if (!c) return res.status(404).json({ success: false, message: "Not found" });
+        const clean = sanitizeLevel(c.data);
+        if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        const row = (await pool.query(
+            `INSERT INTO levels (name, author_id, author, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta)
+             VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`,
+            [clean.name, c.owner_id, c.owner, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
+        await setLevelAudio(row.id, null, clean.decor);
+        await pool.query("UPDATE cloud_levels SET published_id = $2 WHERE id = $1", [c.id, row.id]);
+        adminLog(req.auth.username, "publish_for", c.owner, c.name);
+        res.json({ success: true, level: publicLevel(row) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not publish it" }); }
+});
+app.delete("/api/admin/unpublished/:id", requireAdmin, async (req, res) => {
+    try { await pool.query("DELETE FROM cloud_levels WHERE id = $1", [Number(req.params.id) || 0]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ success: false, message: "Could not delete" }); }
+});
+
+// ---------------------------------------------------------------------------
+// admin: log into a player's account / remove specific stats
+// ---------------------------------------------------------------------------
+app.post("/api/admin/players/:id/impersonate", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        if (req.auth.imp) return res.status(400).json({ success: false, message: "Return to your own account first." });
+        if (isAdminRow(target) && !isAdminName(req.auth.username)) return res.status(403).json({ success: false, message: "Only owners can open another admin's account." });
+        const user = await fetchUser(target.id);
+        const token = jwt.sign({ userId: user.id, username: user.username, imp: req.auth.username }, JWT_SECRET, { expiresIn: "4h" });
+        adminLog(req.auth.username, "impersonate", target.username, "");
+        res.json({ success: true, token, user: publicUser(user, true) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not open that account" }); }
+});
+const STAT_COLUMNS = {
+    games_played: "games_played = 0", games_completed: "games_completed = 0", total_score: "total_score = 0", best_score: "best_score = 0",
+    total_notes_hit: "total_notes_hit = 0", battle: "battle_wins = 0, battle_losses = 0", bonus_stars: "bonus_stars = 0", elo: "elo = 1000", flags: "flags = 0"
+};
+app.post("/api/admin/players/:id/remove-stats", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const fields = Array.isArray(req.body.fields) ? req.body.fields.map(String) : [];
+        const done = [];
+        for (const f of fields) {
+            if (STAT_COLUMNS[f]) { await pool.query(`UPDATE users SET ${STAT_COLUMNS[f]}, updated_at = NOW() WHERE id = $1`, [target.id]); done.push(f); }
+            else if (f === "completions") { await pool.query("DELETE FROM level_completions WHERE user_id = $1", [target.id]); done.push(f); }
+            else if (f === "records") { await pool.query("DELETE FROM level_records WHERE user_id = $1", [target.id]); done.push(f); }
+            else if (f === "daily") { await pool.query("DELETE FROM daily_claims WHERE user_id = $1", [target.id]); done.push(f); }
+        }
+        if (isUuid(String(req.body.levelId || ""))) {
+            await pool.query("DELETE FROM level_completions WHERE user_id = $1 AND level_id = $2", [target.id, req.body.levelId]);
+            await pool.query("DELETE FROM level_records WHERE user_id = $1 AND level_id = $2", [target.id, req.body.levelId]);
+            done.push("one level");
+        }
+        if (!done.length) return res.status(400).json({ success: false, message: "Pick something to remove." });
+        modLog(target.id, req.auth.username, "reset", "Removed: " + done.join(", "));
+        adminLog(req.auth.username, "remove_stats", target.username, done.join(", "));
+        res.json({ success: true, removed: done });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not remove those stats" }); }
+});
+app.get("/api/admin/players/:id/completions", requireAdmin, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false });
+        const r = await pool.query("SELECT l.id, l.name, l.author FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = $1 ORDER BY l.name LIMIT 300", [req.params.id]);
+        res.json({ success: true, levels: r.rows });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not load" }); }
+});
+
 // --- public settings + username change ---
-app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: appSettings.announcement, dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen }));
+app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: appSettings.announcement, dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen, listMaxPoints: appSettings.listMaxPoints }));
 
 app.patch("/api/profile/username", authenticate, async (req, res) => {
     try {
+        if (req.auth.imp) return res.status(403).json({ success: false, message: "You can't change the name while viewing as another player." });
         const name = String(req.body.username || "").trim();
         if (!validUsername(name)) return res.status(400).json({ success: false, message: "Username must be 3-20 characters: letters, numbers, underscores" });
         const me = await pool.query("SELECT username, username_changed_at FROM users WHERE id = $1", [req.auth.userId]);
@@ -1211,6 +1459,10 @@ app.put("/api/admin/settings", requireAdmin, async (req, res) => {
         if (b.dailyBonusStars !== undefined) appSettings.dailyBonusStars = clampInt(b.dailyBonusStars, 0, 50, 3);
         if (b.commentsOpen !== undefined) appSettings.commentsOpen = !!b.commentsOpen;
         if (b.registrationOpen !== undefined) appSettings.registrationOpen = !!b.registrationOpen;
+        if (b.listMaxPoints !== undefined) {
+            appSettings.listMaxPoints = clampInt(b.listMaxPoints, 5, 5000, 250);
+            await pool.query("INSERT INTO app_meta (key, value) VALUES ('list_max', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(appSettings.listMaxPoints)]);
+        }
         await saveAppSettings();
         adminLog(req.auth.username, "settings", "global", JSON.stringify({ maxBpm: appSettings.maxBpm, dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen }));
         io.emit("settings_changed", { announcement: appSettings.announcement, maxBpm: appSettings.maxBpm });
@@ -1471,6 +1723,10 @@ app.patch("/api/admin/levels/:id/list", requireAdmin, async (req, res) => {
             const pos = clampInt(req.body.position, 1, count + 1, count + 1);
             await client.query("UPDATE levels SET list_position = list_position + 1 WHERE list_position >= $1", [pos]);
             await client.query("UPDATE levels SET list_position = $2, updated_at = NOW() WHERE id = $1", [req.params.id, pos]);
+        }
+        if (req.body.points !== undefined) {
+            const pts = req.body.points === null || req.body.points === "" ? null : clampInt(req.body.points, 1, 100000, 5);
+            await client.query("UPDATE levels SET list_points = $2 WHERE id = $1", [req.params.id, pts]);
         }
         await client.query("COMMIT");
         res.json({ success: true });
