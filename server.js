@@ -221,6 +221,9 @@ async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS cloud_levels (id BIGSERIAL PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL,
         local_id VARCHAR(60) NOT NULL, name VARCHAR(80) NOT NULL, data JSONB NOT NULL, tile_count INTEGER NOT NULL DEFAULT 0, published_id UUID, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (owner_id, local_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS news_comments (id BIGSERIAL PRIMARY KEY, news_id BIGINT NOT NULL REFERENCES news(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        username VARCHAR(20) NOT NULL, text VARCHAR(300) NOT NULL, parent_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE TABLE IF NOT EXISTS news_likes (news_id BIGINT NOT NULL REFERENCES news(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY (news_id, user_id))");
     await loadAppSettings();
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
     await pool.query("INSERT INTO app_meta (key, value) VALUES ('list_max', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(appSettings.listMaxPoints)]);
@@ -1320,9 +1323,62 @@ app.delete("/api/admin/songs/:id", requireAdmin, async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get("/api/news", async (req, res) => {
     try {
-        const r = await pool.query("SELECT id, title, body, image, author, created_at FROM news ORDER BY created_at DESC LIMIT 40");
-        res.json({ success: true, news: r.rows.map(n => ({ id: Number(n.id), title: n.title, body: n.body, image: n.image, author: n.author, createdAt: n.created_at })) });
+        const me = optionalUserId(req);
+        const r = await pool.query(`SELECT n.id, n.title, n.body, n.image, n.author, n.created_at,
+                (SELECT COUNT(*) FROM news_likes k WHERE k.news_id = n.id)::int AS likes,
+                EXISTS (SELECT 1 FROM news_likes k WHERE k.news_id = n.id AND k.user_id = $1) AS liked,
+                (SELECT COUNT(*) FROM news_comments c WHERE c.news_id = n.id)::int AS comments
+            FROM news n ORDER BY n.created_at DESC LIMIT 40`, [me]);
+        res.json({ success: true, news: r.rows.map(n => ({ id: Number(n.id), title: n.title, body: n.body, image: n.image, author: n.author, createdAt: n.created_at, likes: n.likes, liked: !!n.liked, comments: n.comments })) });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load announcements" }); }
+});
+app.post("/api/news/:id/like", authenticate, rateLimit("nlike", 200, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const ex = await pool.query("DELETE FROM news_likes WHERE news_id = $1 AND user_id = $2 RETURNING 1", [id, req.auth.userId]);
+        let liked = false;
+        if (!ex.rows.length) {
+            const ins = await pool.query("INSERT INTO news_likes (news_id, user_id) SELECT id, $2 FROM news WHERE id = $1 ON CONFLICT DO NOTHING RETURNING 1", [id, req.auth.userId]);
+            if (!ins.rows.length) return res.status(404).json({ success: false, message: "Post not found" });
+            liked = true;
+        }
+        const n = await pool.query("SELECT COUNT(*)::int AS n FROM news_likes WHERE news_id = $1", [id]);
+        res.json({ success: true, liked, likes: n.rows[0].n });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not like that" }); }
+});
+app.get("/api/news/:id/comments", async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT c.id, c.user_id, c.username, c.text, c.created_at, c.parent_id, COALESCE(u.is_admin, FALSE) AS is_admin, u.username AS uname
+            FROM news_comments c LEFT JOIN users u ON u.id = c.user_id WHERE c.news_id = $1 ORDER BY c.created_at ASC LIMIT 300`, [clampInt(req.params.id, 1, 9e15, 0)]);
+        res.json({ success: true, comments: r.rows.map(c => ({ id: Number(c.id), userId: c.user_id, username: c.username, text: c.text, createdAt: c.created_at, parentId: c.parent_id ? Number(c.parent_id) : null, isAdmin: isAdminRow({ username: c.uname || c.username, is_admin: c.is_admin }) })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load replies" }); }
+});
+app.post("/api/news/:id/comments", authenticate, rateLimit("ncomment", 40, 60 * 60 * 1000), async (req, res) => {
+    try {
+        if (!appSettings.commentsOpen) return res.status(403).json({ success: false, message: "Comments are turned off right now." });
+        if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted." });
+        const text = String(req.body.text || "").trim().slice(0, 300);
+        if (!text) return res.status(400).json({ success: false, message: "Write something first." });
+        const nid = clampInt(req.params.id, 1, 9e15, 0);
+        let parent = null;
+        if (req.body.parentId) {
+            const p = await pool.query("SELECT id, parent_id FROM news_comments WHERE id = $1 AND news_id = $2", [clampInt(req.body.parentId, 1, 9e15, 0), nid]);
+            if (!p.rows.length) return res.status(404).json({ success: false, message: "That reply is gone." });
+            parent = p.rows[0].parent_id || p.rows[0].id;
+        }
+        const r = await pool.query("INSERT INTO news_comments (news_id, user_id, username, text, parent_id) SELECT id, $2, $3, $4, $5 FROM news WHERE id = $1 RETURNING id", [nid, req.auth.userId, req.auth.username, text, parent]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Post not found" });
+        res.json({ success: true, id: Number(r.rows[0].id) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not post" }); }
+});
+app.delete("/api/news/comments/:id", authenticate, async (req, res) => {
+    try {
+        const admin = await checkAdmin(req.auth.userId), id = clampInt(req.params.id, 1, 9e15, 0);
+        const r = await pool.query("DELETE FROM news_comments WHERE id = $1 AND ($2 OR user_id = $3) RETURNING id", [id, admin, req.auth.userId]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
+        await pool.query("DELETE FROM news_comments WHERE parent_id = $1", [id]);
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not delete" }); }
 });
 function cleanNews(b) {
     const title = String(b.title || "").trim().slice(0, 120), body = String(b.body || "").slice(0, 5000);
