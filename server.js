@@ -198,6 +198,9 @@ async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS level_comments (id BIGSERIAL PRIMARY KEY, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, username VARCHAR(20) NOT NULL, text VARCHAR(300) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query("CREATE INDEX IF NOT EXISTS level_comments_idx ON level_comments (level_id, created_at DESC)");
+    await pool.query("ALTER TABLE level_comments ADD COLUMN IF NOT EXISTS parent_id BIGINT");
+    await pool.query("ALTER TABLE level_comments ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE");
+    await pool.query("CREATE TABLE IF NOT EXISTS comment_likes (comment_id BIGINT NOT NULL REFERENCES level_comments(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY (comment_id, user_id))");
     await pool.query(`CREATE TABLE IF NOT EXISTS level_versions (id BIGSERIAL PRIMARY KEY, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE, snapshot JSONB NOT NULL, saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query("CREATE INDEX IF NOT EXISTS level_versions_idx ON level_versions (level_id, saved_at DESC)");
     await pool.query(`CREATE TABLE IF NOT EXISTS drafts (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL,
@@ -682,7 +685,7 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
             const lvl = await pool.query(`SELECT author_id, name, jsonb_array_length(level_data) AS notes,
                 COALESCE((SELECT MAX((e->>'time')::float) FROM jsonb_array_elements(level_data) e), 0) AS last_time FROM levels WHERE id = $1`, [levelId]);
             const row = lvl.rows[0];
-            counted = !!row && row.author_id !== me;
+            counted = !!row && row.author_id !== me && !req.auth.imp;   // viewing-as-player sessions never earn stats
             if (counted) {
                 let completed = !!req.body.completed;
                 let score = Math.max(0, Math.min(1e9, Math.floor(Number(req.body.score) || 0)));
@@ -806,33 +809,90 @@ app.post("/api/reports", authenticate, rateLimit("report", 15, 60 * 60 * 1000), 
     } catch (error) { console.error("Report error:", error); res.status(500).json({ success: false, message: "Could not send the report" }); }
 });
 
-// --- comments ---
+// --- comments (likes, replies, pinning, sort) ---
+function optionalUserId(req) {
+    const [scheme, token] = (req.headers.authorization || "").split(" ");
+    if (scheme !== "Bearer" || !token) return null;
+    try { return jwt.verify(token, JWT_SECRET).userId; } catch { return null; }
+}
 app.get("/api/levels/:id/comments", async (req, res) => {
     try {
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
-        const r = await pool.query("SELECT id, user_id, username, text, created_at FROM level_comments WHERE level_id = $1 ORDER BY created_at DESC LIMIT 50", [req.params.id]);
-        res.json({ success: true, comments: r.rows.map(c => ({ id: Number(c.id), userId: c.user_id, username: c.username, text: c.text, createdAt: c.created_at })) });
-    } catch (error) { res.status(500).json({ success: false, message: "Could not load comments" }); }
+        const me = optionalUserId(req);
+        const lv = await pool.query("SELECT author_id FROM levels WHERE id = $1", [req.params.id]);
+        if (!lv.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+        const r = await pool.query(`SELECT c.id, c.user_id, c.username, c.text, c.created_at, c.parent_id, c.pinned,
+                (SELECT COUNT(*) FROM comment_likes k WHERE k.comment_id = c.id)::int AS likes,
+                EXISTS (SELECT 1 FROM comment_likes k WHERE k.comment_id = c.id AND k.user_id = $2) AS liked,
+                COALESCE(u.is_admin, FALSE) AS is_admin, u.username AS uname
+            FROM level_comments c LEFT JOIN users u ON u.id = c.user_id
+            WHERE c.level_id = $1 ORDER BY c.created_at DESC LIMIT 300`, [req.params.id, me]);
+        const authorId = lv.rows[0].author_id;
+        const comments = r.rows.map(c => ({
+            id: Number(c.id), userId: c.user_id, username: c.username, text: c.text, createdAt: c.created_at,
+            parentId: c.parent_id ? Number(c.parent_id) : null, pinned: !!c.pinned, likes: c.likes, liked: !!c.liked,
+            isAuthor: !!authorId && c.user_id === authorId,
+            isAdmin: isAdminRow({ username: c.uname || c.username, is_admin: c.is_admin })
+        }));
+        res.json({ success: true, comments, levelAuthorId: authorId || null });
+    } catch (error) { console.error("Comments load error:", error); res.status(500).json({ success: false, message: "Could not load comments" }); }
 });
-app.post("/api/levels/:id/comments", authenticate, rateLimit("comment", 30, 60 * 60 * 1000), async (req, res) => {
+app.post("/api/levels/:id/comments", authenticate, rateLimit("comment", 40, 60 * 60 * 1000), async (req, res) => {
     try {
         if (!appSettings.commentsOpen) return res.status(403).json({ success: false, message: "Comments are turned off right now." });
         if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted." });
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const text = String(req.body.text || "").trim().slice(0, 300);
         if (!text) return res.status(400).json({ success: false, message: "Write something first." });
-        const r = await pool.query("INSERT INTO level_comments (level_id, user_id, username, text) SELECT id, $2, $3, $4 FROM levels WHERE id = $1 RETURNING id", [req.params.id, req.auth.userId, req.auth.username, text]);
+        let parent = null;
+        if (req.body.parentId) {
+            const p = await pool.query("SELECT id, parent_id FROM level_comments WHERE id = $1 AND level_id = $2", [clampInt(req.body.parentId, 1, 9e15, 0), req.params.id]);
+            if (!p.rows.length) return res.status(404).json({ success: false, message: "That comment is gone." });
+            parent = p.rows[0].parent_id || p.rows[0].id;   // replies stay one level deep
+        }
+        const r = await pool.query("INSERT INTO level_comments (level_id, user_id, username, text, parent_id) SELECT id, $2, $3, $4, $5 FROM levels WHERE id = $1 RETURNING id", [req.params.id, req.auth.userId, req.auth.username, text, parent]);
         if (!r.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
-        res.json({ success: true });
-    } catch (error) { res.status(500).json({ success: false, message: "Could not post comment" }); }
+        res.json({ success: true, id: Number(r.rows[0].id) });
+    } catch (error) { console.error("Comment post error:", error); res.status(500).json({ success: false, message: "Could not post comment" }); }
+});
+app.post("/api/comments/:id/like", authenticate, rateLimit("clike", 300, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const ex = await pool.query("DELETE FROM comment_likes WHERE comment_id = $1 AND user_id = $2 RETURNING 1", [id, req.auth.userId]);
+        let liked = false;
+        if (!ex.rows.length) {
+            const ins = await pool.query("INSERT INTO comment_likes (comment_id, user_id) SELECT id, $2 FROM level_comments WHERE id = $1 ON CONFLICT DO NOTHING RETURNING 1", [id, req.auth.userId]);
+            if (!ins.rows.length) return res.status(404).json({ success: false, message: "Comment not found" });
+            liked = true;
+        }
+        const n = await pool.query("SELECT COUNT(*)::int AS n FROM comment_likes WHERE comment_id = $1", [id]);
+        res.json({ success: true, liked, likes: n.rows[0].n });
+    } catch (error) { console.error("Like error:", error); res.status(500).json({ success: false, message: "Could not like that" }); }
+});
+app.post("/api/comments/:id/pin", authenticate, async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const c = await pool.query("SELECT c.id, c.level_id, c.pinned, c.parent_id, l.author_id FROM level_comments c JOIN levels l ON l.id = c.level_id WHERE c.id = $1", [id]);
+        if (!c.rows.length) return res.status(404).json({ success: false, message: "Comment not found" });
+        const row = c.rows[0];
+        const admin = await checkAdmin(req.auth.userId);
+        if (!admin && row.author_id !== req.auth.userId) return res.status(403).json({ success: false, message: "Only the level's creator can pin comments." });
+        if (row.parent_id) return res.status(400).json({ success: false, message: "Only top comments can be pinned." });
+        const pin = !row.pinned;
+        if (pin) await pool.query("UPDATE level_comments SET pinned = FALSE WHERE level_id = $1", [row.level_id]);
+        await pool.query("UPDATE level_comments SET pinned = $2 WHERE id = $1", [id, pin]);
+        res.json({ success: true, pinned: pin });
+    } catch (error) { console.error("Pin error:", error); res.status(500).json({ success: false, message: "Could not pin that" }); }
 });
 app.delete("/api/comments/:id", authenticate, async (req, res) => {
     try {
         const admin = await checkAdmin(req.auth.userId);
-        const r = await pool.query("DELETE FROM level_comments WHERE id = $1 AND ($2 OR user_id = $3) RETURNING id", [clampInt(req.params.id, 1, 9e15, 0), admin, req.auth.userId]);
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const r = await pool.query(`DELETE FROM level_comments c USING levels l WHERE c.id = $1 AND l.id = c.level_id AND ($2 OR c.user_id = $3 OR l.author_id = $3) RETURNING c.id`, [id, admin, req.auth.userId]);
         if (!r.rows.length) return res.status(404).json({ success: false, message: "Comment not found" });
+        await pool.query("DELETE FROM level_comments WHERE parent_id = $1", [id]);
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ success: false, message: "Could not delete comment" }); }
+    } catch (error) { console.error("Comment delete error:", error); res.status(500).json({ success: false, message: "Could not delete comment" }); }
 });
 
 // --- friends ---
@@ -2184,6 +2244,29 @@ async function tryPairQueue() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// live streams: the streamer's browser sends video/audio straight to each viewer (WebRTC); the server only
+// relays the handshake (signaling), keeps the live list, and carries chat. Nothing is recorded server-side -
+// the streamer records locally and downloads the file when the stream ends.
+// ---------------------------------------------------------------------------
+const streams = new Map();            // id -> { id, hostSocket, userId, username, title, levelName, startedAt, viewers:Set, chat:[] }
+const MAX_STREAM_VIEWERS = Math.max(1, Math.min(30, Number(process.env.MAX_STREAM_VIEWERS) || 8));
+const streamPublic = st => ({ id: st.id, username: st.username, title: st.title, levelName: st.levelName, startedAt: st.startedAt, viewers: st.viewers.size });
+const streamList = () => [...streams.values()].map(streamPublic).sort((a, b) => b.viewers - a.viewers || a.startedAt - b.startedAt);
+function endStream(st, reason) {
+    if (!streams.has(st.id)) return;
+    streams.delete(st.id);
+    io.to("stream:" + st.id).emit("stream_ended", { id: st.id, reason: reason || "The stream ended." });
+    io.in("stream:" + st.id).socketsLeave("stream:" + st.id);
+    io.emit("streams_changed", streamList());
+}
+app.get("/api/streams", (req, res) => res.json({ success: true, streams: streamList() }));
+app.get("/api/streams/config", (req, res) => {
+    const iceServers = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
+    if (process.env.TURN_URL) iceServers.push({ urls: String(process.env.TURN_URL).split(","), username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
+    res.json({ success: true, iceServers, maxViewers: MAX_STREAM_VIEWERS });
+});
+
 io.on("connection", socket => {
     lobby.set(socket.id, socket);
     socket.emit("welcome", { id: socket.id, name: socket.data.name, registered: !!socket.data.userId });
@@ -2225,6 +2308,87 @@ io.on("connection", socket => {
         if (!payload || !isUuid(String(payload.levelId))) return;
         socket.to("globe:" + payload.levelId).volatile.emit("globe_tap", { name: socket.data.name, idx: clampInt(payload.idx, 0, 100000), lane: clampInt(payload.lane, 0, 3) });
     });
+
+    // --- live streams ---
+    const myStream = () => [...streams.values()].find(x => x.hostSocket === socket.id);
+    const leaveStreams = () => {
+        [...socket.rooms].filter(r => String(r).startsWith("stream:")).forEach(r => {
+            const st = streams.get(String(r).slice(7)); socket.leave(r);
+            if (st && st.viewers.delete(socket.id)) {
+                const host = lobby.get(st.hostSocket); if (host) host.emit("stream_viewer_left", { viewerId: socket.id });
+                io.to("stream:" + st.id).emit("stream_viewers", { id: st.id, count: st.viewers.size }); io.emit("streams_changed", streamList());
+            }
+        });
+    };
+    socket.on("stream_start", async payload => {
+        try {
+            if (!socket.data.userId) return socket.emit("stream_error", { message: "Log in to go live." });
+            if (await isMuted(socket.data.userId)) return socket.emit("stream_error", { message: "You are muted, so you can't stream." });
+            if (myStream()) return socket.emit("stream_error", { message: "You are already live." });
+            for (const x of streams.values()) if (x.userId === socket.data.userId) endStream(x, "The streamer started again somewhere else.");
+            const id = crypto.randomBytes(5).toString("hex");
+            const title = String(payload && payload.title || "").trim().slice(0, 60) || (socket.data.name + "'s stream");
+            const st = { id, hostSocket: socket.id, userId: socket.data.userId, username: socket.data.name, title, levelName: String(payload && payload.levelName || "").slice(0, 60), startedAt: Date.now(), viewers: new Set(), chat: [] };
+            streams.set(id, st);
+            socket.join("stream:" + id);
+            socket.emit("stream_started", streamPublic(st));
+            io.emit("streams_changed", streamList());
+        } catch (e) { console.error("stream_start", e); socket.emit("stream_error", { message: "Could not start the stream." }); }
+    });
+    socket.on("stream_update", payload => {
+        const st = myStream(); if (!st) return;
+        if (payload && typeof payload.levelName === "string") st.levelName = payload.levelName.slice(0, 60);
+        if (payload && typeof payload.title === "string" && payload.title.trim()) st.title = payload.title.trim().slice(0, 60);
+        io.emit("streams_changed", streamList());
+    });
+    socket.on("stream_end", async payload => {
+        const st = payload && payload.id ? streams.get(String(payload.id)) : myStream();
+        if (!st) return;
+        if (st.hostSocket !== socket.id) {
+            if (!socket.data.userId || !(await checkAdmin(socket.data.userId))) return;
+            adminLog(socket.data.name, "stream_end", st.username, st.title);
+            return endStream(st, "An admin ended this stream.");
+        }
+        endStream(st, "The streamer ended the stream.");
+    });
+    socket.on("stream_join", payload => {
+        const st = streams.get(String(payload && payload.id || ""));
+        if (!st) return socket.emit("stream_error", { message: "That stream is over." });
+        if (st.hostSocket === socket.id) return;
+        if (!st.viewers.has(socket.id) && st.viewers.size >= MAX_STREAM_VIEWERS) return socket.emit("stream_error", { message: "This stream is full (" + MAX_STREAM_VIEWERS + " viewers)." });
+        leaveStreams();
+        socket.join("stream:" + st.id);
+        st.viewers.add(socket.id);
+        socket.emit("stream_joined", Object.assign(streamPublic(st), { hostId: st.hostSocket, chat: st.chat.slice(-40) }));
+        const host = lobby.get(st.hostSocket); if (host) host.emit("stream_viewer", { viewerId: socket.id, name: socket.data.name });
+        io.to("stream:" + st.id).emit("stream_viewers", { id: st.id, count: st.viewers.size });
+        io.emit("streams_changed", streamList());
+    });
+    socket.on("stream_leave", leaveStreams);
+    // relays WebRTC offers/answers/ICE between the streamer and one viewer (only inside the same stream)
+    socket.on("stream_signal", payload => {
+        const to = lobby.get(String(payload && payload.to || "")); if (!to || !payload.data) return;
+        const mine = myStream(), theirs = [...streams.values()].find(x => x.hostSocket === to.id);
+        const ok = (mine && mine.viewers.has(to.id)) || (theirs && theirs.viewers.has(socket.id));
+        if (!ok) return;
+        const size = JSON.stringify(payload.data).length; if (size > 20000) return;
+        to.emit("stream_signal", { from: socket.id, data: payload.data });
+    });
+    socket.on("stream_chat", async payload => {
+        try {
+            const st = streams.get(String(payload && payload.id || ""));
+            if (!st || !(st.hostSocket === socket.id || st.viewers.has(socket.id))) return;
+            if (!socket.data.userId) return socket.emit("stream_error", { message: "Log in to chat." });
+            const now = Date.now(); if (socket.data.lastStreamChat && now - socket.data.lastStreamChat < 700) return; socket.data.lastStreamChat = now;
+            if (await isMuted(socket.data.userId)) return socket.emit("stream_error", { message: "You are muted." });
+            const text = String(payload.text || "").trim().slice(0, 200); if (!text) return;
+            const msg = { user: socket.data.name, text, ts: now, host: st.hostSocket === socket.id };
+            st.chat.push(msg); if (st.chat.length > 80) st.chat.shift();
+            io.to("stream:" + st.id).emit("stream_chat", Object.assign({ id: st.id }, msg));
+        } catch (e) {}
+    });
+    socket.on("stream_list", () => socket.emit("stream_list", streamList()));
+    socket.on("disconnecting", () => { const st = myStream(); if (st) endStream(st, "The streamer disconnected."); leaveStreams(); });
 
     socket.on("queue_join", () => {
         if (socket.data.status !== "lobby") return;
