@@ -21,8 +21,10 @@ const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: true, credentials: true },
     maxHttpBufferSize: 8e6,
-    pingInterval: 10000,
-    pingTimeout: 15000
+    pingInterval: 25000,     // school / proxy networks stall for a while: be patient before calling a client dead
+    pingTimeout: 60000,
+    transports: ["polling", "websocket"],
+    connectionStateRecovery: { maxDisconnectionDuration: 60000 }
 });
 
 const PORT = process.env.PORT || 3000;
@@ -224,6 +226,12 @@ async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS news_comments (id BIGSERIAL PRIMARY KEY, news_id BIGINT NOT NULL REFERENCES news(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         username VARCHAR(20) NOT NULL, text VARCHAR(300) NOT NULL, parent_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query("CREATE TABLE IF NOT EXISTS news_likes (news_id BIGINT NOT NULL REFERENCES news(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY (news_id, user_id))");
+    await pool.query(`CREATE TABLE IF NOT EXISTS vods (id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, username VARCHAR(20) NOT NULL, title VARCHAR(60) NOT NULL,
+        level_label VARCHAR(60) NOT NULL DEFAULT '', format VARCHAR(8) NOT NULL DEFAULT 'short', duration INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, mime VARCHAR(40) NOT NULL DEFAULT 'video/webm',
+        views INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE TABLE IF NOT EXISTS vod_blobs (vod_id BIGINT PRIMARY KEY REFERENCES vods(id) ON DELETE CASCADE, data BYTEA NOT NULL)");
+    await pool.query("CREATE TABLE IF NOT EXISTS vod_likes (vod_id BIGINT NOT NULL REFERENCES vods(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY (vod_id, user_id))");
+    await pool.query("CREATE TABLE IF NOT EXISTS vod_views (vod_id BIGINT NOT NULL REFERENCES vods(id) ON DELETE CASCADE, viewer_key TEXT NOT NULL, PRIMARY KEY (vod_id, viewer_key))");
     await loadAppSettings();
     await pool.query("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)");
     await pool.query("INSERT INTO app_meta (key, value) VALUES ('list_max', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [String(appSettings.listMaxPoints)]);
@@ -2307,7 +2315,7 @@ async function tryPairQueue() {
 // ---------------------------------------------------------------------------
 const streams = new Map();            // id -> { id, hostSocket, userId, username, title, levelName, startedAt, viewers:Set, chat:[] }
 const MAX_STREAM_VIEWERS = Math.max(1, Math.min(30, Number(process.env.MAX_STREAM_VIEWERS) || 8));
-const streamPublic = st => ({ id: st.id, username: st.username, title: st.title, levelName: st.levelName, startedAt: st.startedAt, viewers: st.viewers.size });
+const streamPublic = st => ({ id: st.id, username: st.username, title: st.title, levelName: st.levelName, startedAt: st.startedAt, viewers: st.viewers.size, format: st.format, chatOn: st.chatOn });
 const streamList = () => [...streams.values()].map(streamPublic).sort((a, b) => b.viewers - a.viewers || a.startedAt - b.startedAt);
 function endStream(st, reason) {
     if (!streams.has(st.id)) return;
@@ -2316,6 +2324,96 @@ function endStream(st, reason) {
     io.in("stream:" + st.id).socketsLeave("stream:" + st.id);
     io.emit("streams_changed", streamList());
 }
+// ---------------------------------------------------------------------------
+// published stream recordings (VODs): the streamer uploads the file after the stream; anyone can rewatch it.
+// A view counts once per viewer per day; "Popular" sorts by views, "Most liked" by likes.
+// ---------------------------------------------------------------------------
+const VOD_MAX_BYTES = 60 * 1024 * 1024, VOD_MAX_PER_USER = 10;
+const vodRow = (v, liked) => ({ id: Number(v.id), username: v.username, title: v.title, levelLabel: v.level_label, format: v.format, duration: v.duration, size: v.size, views: v.views, likes: v.likes || 0, liked: !!liked, createdAt: v.created_at });
+app.get("/api/vods", async (req, res) => {
+    try {
+        const sort = String(req.query.sort || "recent");
+        const order = sort === "popular" ? "v.views DESC, v.created_at DESC" : sort === "liked" ? "likes DESC, v.created_at DESC" : "v.created_at DESC";
+        const me = optionalUserId(req);
+        const r = await pool.query(`SELECT v.id, v.username, v.title, v.level_label, v.format, v.duration, v.size, v.views, v.created_at,
+                (SELECT COUNT(*) FROM vod_likes k WHERE k.vod_id = v.id)::int AS likes,
+                EXISTS (SELECT 1 FROM vod_likes k WHERE k.vod_id = v.id AND k.user_id = $1) AS liked
+            FROM vods v ORDER BY ${order} LIMIT 50`, [me]);
+        res.json({ success: true, vods: r.rows.map(v => vodRow(v, v.liked)) });
+    } catch (e) { console.error("vods list", e); res.status(500).json({ success: false, message: "Could not load recordings" }); }
+});
+app.post("/api/vods", authenticate, rateLimit("vodpub", 8, 60 * 60 * 1000), express.raw({ type: () => true, limit: "62mb" }), async (req, res) => {
+    try {
+        if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted." });
+        const buf = req.body;
+        if (!Buffer.isBuffer(buf) || buf.length < 1000) return res.status(400).json({ success: false, message: "That recording is empty." });
+        if (buf.length > VOD_MAX_BYTES) return res.status(413).json({ success: false, message: "Recording is over 60 MB. Download it instead." });
+        const have = await pool.query("SELECT COUNT(*)::int AS n FROM vods WHERE user_id = $1", [req.auth.userId]);
+        if (have.rows[0].n >= VOD_MAX_PER_USER) return res.status(400).json({ success: false, message: "You can keep " + VOD_MAX_PER_USER + " recordings. Delete one first." });
+        const dec = h => { try { return decodeURIComponent(String(req.headers[h] || "")); } catch { return ""; } };
+        const mime = /^video\/(webm|mp4)/.test(dec("x-mime")) ? dec("x-mime").split(";")[0] : "video/webm";
+        const title = dec("x-title").trim().slice(0, 60) || (req.auth.username + "'s stream");
+        const format = dec("x-format") === "wide" ? "wide" : "short";
+        const dur = clampInt(dec("x-duration"), 0, 86400, 0);
+        const ins = await pool.query("INSERT INTO vods (user_id, username, title, level_label, format, duration, size, mime) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+            [req.auth.userId, req.auth.username, title, dec("x-level").slice(0, 60), format, dur, buf.length, mime]);
+        await pool.query("INSERT INTO vod_blobs (vod_id, data) VALUES ($1, $2)", [ins.rows[0].id, buf]);
+        res.json({ success: true, id: Number(ins.rows[0].id) });
+    } catch (e) { console.error("vod publish", e); res.status(500).json({ success: false, message: "Could not publish the recording" }); }
+});
+app.get("/api/vods/:id/video", async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const m = await pool.query("SELECT size, mime FROM vods WHERE id = $1", [id]);
+        if (!m.rows.length) return res.status(404).end();
+        const size = m.rows[0].size;
+        res.set({ "Content-Type": m.rows[0].mime, "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+        const rng = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
+        let start = 0, end = size - 1;
+        if (rng) {
+            start = rng[1] ? parseInt(rng[1], 10) : 0; end = rng[2] ? Math.min(parseInt(rng[2], 10), size - 1) : Math.min(size - 1, start + 2 * 1024 * 1024 - 1);
+            if (start > end || start >= size) return res.status(416).set("Content-Range", "bytes */" + size).end();
+        }
+        const part = await pool.query("SELECT substring(data FROM $2 FOR $3) AS chunk FROM vod_blobs WHERE vod_id = $1", [id, start + 1, end - start + 1]);
+        if (!part.rows.length) return res.status(404).end();
+        if (rng) res.status(206).set("Content-Range", `bytes ${start}-${end}/${size}`);
+        res.set("Content-Length", end - start + 1);
+        res.end(part.rows[0].chunk);
+    } catch (e) { console.error("vod video", e); res.status(500).end(); }
+});
+app.post("/api/vods/:id/view", async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), me = optionalUserId(req);
+        const key = (me || "ip:" + (req.ip || "")) + ":" + new Date().toISOString().slice(0, 10);
+        const ins = await pool.query("INSERT INTO vod_views (vod_id, viewer_key) SELECT id, $2 FROM vods WHERE id = $1 ON CONFLICT DO NOTHING RETURNING 1", [id, key]);
+        if (ins.rows.length) await pool.query("UPDATE vods SET views = views + 1 WHERE id = $1", [id]);
+        const v = await pool.query("SELECT views FROM vods WHERE id = $1", [id]);
+        res.json({ success: true, views: v.rows[0] ? v.rows[0].views : 0 });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+app.post("/api/vods/:id/like", authenticate, rateLimit("vlike", 200, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0);
+        const ex = await pool.query("DELETE FROM vod_likes WHERE vod_id = $1 AND user_id = $2 RETURNING 1", [id, req.auth.userId]);
+        let liked = false;
+        if (!ex.rows.length) {
+            const ins = await pool.query("INSERT INTO vod_likes (vod_id, user_id) SELECT id, $2 FROM vods WHERE id = $1 ON CONFLICT DO NOTHING RETURNING 1", [id, req.auth.userId]);
+            if (!ins.rows.length) return res.status(404).json({ success: false, message: "Recording not found" });
+            liked = true;
+        }
+        const n = await pool.query("SELECT COUNT(*)::int AS n FROM vod_likes WHERE vod_id = $1", [id]);
+        res.json({ success: true, liked, likes: n.rows[0].n });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not like that" }); }
+});
+app.delete("/api/vods/:id", authenticate, async (req, res) => {
+    try {
+        const admin = await checkAdmin(req.auth.userId), id = clampInt(req.params.id, 1, 9e15, 0);
+        const r = await pool.query("DELETE FROM vods WHERE id = $1 AND ($2 OR user_id = $3) RETURNING id", [id, admin, req.auth.userId]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not delete" }); }
+});
+
 app.get("/api/streams", (req, res) => res.json({ success: true, streams: streamList() }));
 app.get("/api/streams/config", (req, res) => {
     const iceServers = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
@@ -2325,6 +2423,7 @@ app.get("/api/streams/config", (req, res) => {
 
 io.on("connection", socket => {
     lobby.set(socket.id, socket);
+    socket.emit("voice_count", (io.sockets.adapter.rooms.get("voice:global") || { size: 0 }).size);
     socket.emit("welcome", { id: socket.id, name: socket.data.name, registered: !!socket.data.userId });
     schedulePresence();
 
@@ -2384,10 +2483,11 @@ io.on("connection", socket => {
             for (const x of streams.values()) if (x.userId === socket.data.userId) endStream(x, "The streamer started again somewhere else.");
             const id = crypto.randomBytes(5).toString("hex");
             const title = String(payload && payload.title || "").trim().slice(0, 60) || (socket.data.name + "'s stream");
-            const st = { id, hostSocket: socket.id, userId: socket.data.userId, username: socket.data.name, title, levelName: String(payload && payload.levelName || "").slice(0, 60), startedAt: Date.now(), viewers: new Set(), chat: [] };
+            const st = { id, hostSocket: socket.id, userId: socket.data.userId, username: socket.data.name, title, levelName: String(payload && payload.levelName || "").slice(0, 60), startedAt: Date.now(), viewers: new Set(), chat: [], format: payload && payload.format === "wide" ? "wide" : "short", chatOn: !(payload && payload.chatOn === false) };
             streams.set(id, st);
             socket.join("stream:" + id);
-            socket.emit("stream_started", streamPublic(st));
+            st.key = crypto.randomBytes(12).toString("hex");
+            socket.emit("stream_started", Object.assign(streamPublic(st), { key: st.key }));
             io.emit("streams_changed", streamList());
         } catch (e) { console.error("stream_start", e); socket.emit("stream_error", { message: "Could not start the stream." }); }
     });
@@ -2395,6 +2495,7 @@ io.on("connection", socket => {
         const st = myStream(); if (!st) return;
         if (payload && typeof payload.levelName === "string") st.levelName = payload.levelName.slice(0, 60);
         if (payload && typeof payload.title === "string" && payload.title.trim()) st.title = payload.title.trim().slice(0, 60);
+        if (payload && typeof payload.chatOn === "boolean" && payload.chatOn !== st.chatOn) { st.chatOn = payload.chatOn; io.to("stream:" + st.id).emit("stream_chatmode", { id: st.id, chatOn: st.chatOn }); }
         io.emit("streams_changed", streamList());
     });
     socket.on("stream_end", async payload => {
@@ -2444,7 +2545,51 @@ io.on("connection", socket => {
         } catch (e) {}
     });
     socket.on("stream_list", () => socket.emit("stream_list", streamList()));
-    socket.on("disconnecting", () => { const st = myStream(); if (st) endStream(st, "The streamer disconnected."); leaveStreams(); });
+    // a dropped streamer gets 45 s to come back (school Wi-Fi hiccups) before the stream is closed
+    socket.on("disconnecting", () => {
+        const st = myStream();
+        if (st) {
+            st.hostSocket = null; io.to("stream:" + st.id).emit("stream_host_wait", { id: st.id });
+            clearTimeout(st.grace); st.grace = setTimeout(() => endStream(st, "The streamer disconnected."), 45000);
+        }
+        leaveStreams();
+    });
+    socket.on("stream_resume", payload => {
+        const st = streams.get(String(payload && payload.id || ""));
+        if (!st || !socket.data.userId || st.userId !== socket.data.userId || st.key !== String(payload.key || "")) return socket.emit("stream_error", { message: "Your stream was closed.", gone: true });
+        clearTimeout(st.grace); st.hostSocket = socket.id; socket.join("stream:" + st.id);
+        socket.emit("stream_started", Object.assign(streamPublic(st), { key: st.key, resumed: true }));
+        io.to("stream:" + st.id).emit("stream_host_changed", { id: st.id, hostId: socket.id });
+        st.viewers.forEach(v => socket.emit("stream_viewer", { viewerId: v }));
+    });
+    // fallback for networks that block peer-to-peer video: the streamer's video travels through the server
+    socket.on("stream_relay", payload => {
+        const st = streams.get(String(payload && payload.id || "")); if (!st || !st.viewers.has(socket.id)) return;
+        if (payload.on) socket.join("relay:" + st.id); else socket.leave("relay:" + st.id);
+        const host = st.hostSocket && lobby.get(st.hostSocket); if (host && payload.on) host.emit("stream_relay_need", { id: st.id });
+    });
+    socket.on("stream_chunk", payload => {
+        const st = streams.get(String(payload && payload.id || "")); if (!st || st.hostSocket !== socket.id || !payload.buf) return;
+        socket.to("relay:" + st.id).emit("stream_chunk", { id: st.id, init: !!payload.init, buf: payload.buf });
+    });
+    // global voice room: tiny PCM frames relayed through the server (works wherever websockets/polling work)
+    const voiceMembers = async () => { const socks = await io.in("voice:global").fetchSockets(); return socks.map(x => ({ id: x.id, name: x.data.name })); };
+    const voiceBroadcast = async () => { try { const m = await voiceMembers(); io.to("voice:global").emit("voice_members", m); io.emit("voice_count", m.length); } catch (e) {} };
+    socket.on("voice_join", async () => {
+        if (!socket.data.userId) return socket.emit("voice_error", { message: "Log in to use voice chat." });
+        if (await isMuted(socket.data.userId)) return socket.emit("voice_error", { message: "You are muted." });
+        const m = await voiceMembers();
+        if (m.length >= 12 && !m.find(x => x.id === socket.id)) return socket.emit("voice_error", { message: "The voice room is full (12)." });
+        socket.join("voice:global"); voiceBroadcast();
+    });
+    socket.on("voice_leave", () => { socket.leave("voice:global"); voiceBroadcast(); socket.emit("voice_members", []); });
+    socket.on("voice_data", payload => {
+        if (!socket.rooms.has("voice:global") || !payload || !payload.buf) return;
+        const now = Date.now(); socket.data.vw = (socket.data.vw || []).filter(t => now - t < 1000); if (socket.data.vw.length >= 40) return; socket.data.vw.push(now);
+        const n = payload.buf.byteLength || payload.buf.length || 0; if (n > 30000) return;
+        socket.to("voice:global").volatile.emit("voice_data", { from: socket.id, name: socket.data.name, rate: Number(payload.rate) || 16000, buf: payload.buf });
+    });
+    socket.on("disconnect", () => { setTimeout(voiceBroadcast, 300); });
 
     socket.on("queue_join", () => {
         if (socket.data.status !== "lobby") return;
