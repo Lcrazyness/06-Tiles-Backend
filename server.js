@@ -227,6 +227,10 @@ async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS cloud_level_versions (id BIGSERIAL PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL,
         local_id VARCHAR(60) NOT NULL, name VARCHAR(80) NOT NULL, data JSONB NOT NULL, tile_count INTEGER NOT NULL DEFAULT 0, saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query("CREATE INDEX IF NOT EXISTS cloud_level_versions_idx ON cloud_level_versions (owner_id, local_id, id DESC)");
+    // music of device levels: stored once per file (by SHA-256), levels and versions just point at it
+    await pool.query("ALTER TABLE cloud_levels ADD COLUMN IF NOT EXISTS audio_sha CHAR(64)");
+    await pool.query("ALTER TABLE cloud_level_versions ADD COLUMN IF NOT EXISTS audio_sha CHAR(64)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS cloud_audio (sha CHAR(64) PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, mime VARCHAR(60) NOT NULL, size INTEGER NOT NULL, data BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query(`INSERT INTO cloud_level_versions (owner_id, owner, local_id, name, data, tile_count, saved_at)
         SELECT c.owner_id, c.owner, c.local_id, c.name, c.data, c.tile_count, c.updated_at FROM cloud_levels c
         WHERE NOT EXISTS (SELECT 1 FROM cloud_level_versions v WHERE v.owner_id = c.owner_id AND v.local_id = c.local_id)`);
@@ -1435,22 +1439,46 @@ app.put("/api/sync/levels/:localId", authenticate, rateLimit("sync", 240, 60 * 6
         const clean = sanitizeLevel(body);
         if (clean.error) return res.json({ success: true, skipped: true });
         const pub = req.body.onlineId && isUuid(req.body.onlineId) ? req.body.onlineId : null;
-        await pool.query(`INSERT INTO cloud_levels (owner_id, owner, local_id, name, data, tile_count, published_id, updated_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,NOW())
-            ON CONFLICT (owner_id, local_id) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data, tile_count = EXCLUDED.tile_count, published_id = EXCLUDED.published_id, owner = EXCLUDED.owner, updated_at = NOW()`,
-            [req.auth.userId, req.auth.username, localId, clean.name, JSON.stringify(body), clean.notes.length, pub]);
+        const sha = /^[0-9a-f]{64}$/.test(String(req.body.audioSha || "")) ? String(req.body.audioSha) : null;
+        if (!sha) { delete body.audioSha; delete body.audioMime; }
+        await pool.query(`INSERT INTO cloud_levels (owner_id, owner, local_id, name, data, tile_count, published_id, audio_sha, updated_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8,NOW())
+            ON CONFLICT (owner_id, local_id) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data, tile_count = EXCLUDED.tile_count, published_id = EXCLUDED.published_id, audio_sha = EXCLUDED.audio_sha, owner = EXCLUDED.owner, updated_at = NOW()`,
+            [req.auth.userId, req.auth.username, localId, clean.name, JSON.stringify(body), clean.notes.length, pub, sha]);
         try {   // version history (changes within 2 minutes are merged into one version; newest 25 are kept)
             const json = JSON.stringify(body);
             const last = (await pool.query("SELECT id, (data = $3::jsonb) AS same, saved_at > NOW() - INTERVAL '2 minutes' AS fresh FROM cloud_level_versions WHERE owner_id = $1 AND local_id = $2 ORDER BY id DESC LIMIT 1", [req.auth.userId, localId, json])).rows[0];
             if (!last || !last.same) {
-                if (last && last.fresh) await pool.query("UPDATE cloud_level_versions SET name = $2, data = $3::jsonb, tile_count = $4, owner = $5, saved_at = NOW() WHERE id = $1", [last.id, clean.name, json, clean.notes.length, req.auth.username]);
+                if (last && last.fresh) await pool.query("UPDATE cloud_level_versions SET name = $2, data = $3::jsonb, tile_count = $4, owner = $5, audio_sha = $6, saved_at = NOW() WHERE id = $1", [last.id, clean.name, json, clean.notes.length, req.auth.username, sha]);
                 else {
-                    await pool.query("INSERT INTO cloud_level_versions (owner_id, owner, local_id, name, data, tile_count) VALUES ($1,$2,$3,$4,$5::jsonb,$6)", [req.auth.userId, req.auth.username, localId, clean.name, json, clean.notes.length]);
+                    await pool.query("INSERT INTO cloud_level_versions (owner_id, owner, local_id, name, data, tile_count, audio_sha) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7)", [req.auth.userId, req.auth.username, localId, clean.name, json, clean.notes.length, sha]);
                     await pool.query("DELETE FROM cloud_level_versions WHERE owner_id = $1 AND local_id = $2 AND id NOT IN (SELECT id FROM cloud_level_versions WHERE owner_id = $1 AND local_id = $2 ORDER BY id DESC LIMIT 25)", [req.auth.userId, localId]);
+                    await pool.query("DELETE FROM cloud_audio a WHERE a.owner_id = $1 AND NOT EXISTS (SELECT 1 FROM cloud_level_versions v WHERE v.audio_sha = a.sha) AND NOT EXISTS (SELECT 1 FROM cloud_levels c WHERE c.audio_sha = a.sha)", [req.auth.userId]);   // drop music no version uses any more
                 }
             }
         } catch (e) { console.error("level version save failed", e.message); }
+        const needAudio = !!sha && !(await pool.query("SELECT 1 FROM cloud_audio WHERE sha = $1", [sha])).rows.length;
+        res.json({ success: true, needAudio });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.put("/api/sync/audio/:sha", authenticate, rateLimit("syncaudio", 60, 60 * 60 * 1000), express.raw({ type: () => true, limit: "9mb" }), async (req, res) => {
+    try {
+        const sha = String(req.params.sha || "");
+        if (!/^[0-9a-f]{64}$/.test(sha) || !Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ success: false, message: "Bad audio" });
+        if (crypto.createHash("sha256").update(req.body).digest("hex") !== sha) return res.status(400).json({ success: false, message: "Audio did not match its fingerprint" });
+        const mime = /^audio\/[a-z0-9.+-]{1,40}$/i.test(String(req.headers["x-mime"] || "")) ? String(req.headers["x-mime"]).toLowerCase() : "audio/mpeg";
+        const used = Number((await pool.query("SELECT COALESCE(SUM(size),0) AS n FROM cloud_audio WHERE owner_id = $1", [req.auth.userId])).rows[0].n);
+        if (used + req.body.length > 40 * 1024 * 1024) return res.status(413).json({ success: false, message: "Saved-music limit reached for this account" });
+        await pool.query("INSERT INTO cloud_audio (sha, owner_id, mime, size, data) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (sha) DO NOTHING", [sha, req.auth.userId, mime, req.body.length, req.body]);
         res.json({ success: true });
     } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.get("/api/admin/audio/:sha", requireAdmin, async (req, res) => {
+    try {
+        if (!/^[0-9a-f]{64}$/.test(String(req.params.sha))) return res.status(400).end();
+        const r = await pool.query("SELECT mime, data FROM cloud_audio WHERE sha = $1", [req.params.sha]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "No music saved for this level" });
+        res.set({ "Content-Type": r.rows[0].mime, "Cache-Control": "private, max-age=3600" }).send(r.rows[0].data);
+    } catch (e) { res.status(500).end(); }
 });
 app.delete("/api/sync/levels/:localId", authenticate, async (req, res) => {
     try { await pool.query("DELETE FROM cloud_levels WHERE owner_id = $1 AND local_id = $2", [req.auth.userId, String(req.params.localId).slice(0, 60)]); res.json({ success: true }); }
@@ -1479,7 +1507,9 @@ app.post("/api/admin/unpublished/:id/publish", requireAdmin, async (req, res) =>
             `INSERT INTO levels (name, author_id, author, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta)
              VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`,
             [clean.name, c.owner_id, c.owner, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
-        await setLevelAudio(row.id, null, clean.decor);
+        let audioUrl = null;
+        if (c.audio_sha) { const a = (await pool.query("SELECT mime, data FROM cloud_audio WHERE sha = $1", [c.audio_sha])).rows[0]; if (a) { const url = "data:" + a.mime + ";base64," + a.data.toString("base64"); if (url.length <= 8600000) audioUrl = url; } }
+        await setLevelAudio(row.id, audioUrl, clean.decor);
         await pool.query("UPDATE cloud_levels SET published_id = $2 WHERE id = $1", [c.id, row.id]);
         adminLog(req.auth.username, "publish_for", c.owner, c.name);
         res.json({ success: true, level: publicLevel(row) });
@@ -1508,15 +1538,15 @@ app.get("/api/admin/device-levels", requireAdmin, async (req, res) => {
 app.get("/api/admin/device-versions", requireAdmin, async (req, res) => {
     try {
         if (!isUuid(req.query.owner)) return res.status(400).json({ success: false, message: "Bad player" });
-        const r = await pool.query("SELECT id, name, tile_count, saved_at FROM cloud_level_versions WHERE owner_id = $1 AND local_id = $2 ORDER BY id DESC", [req.query.owner, String(req.query.local || "").slice(0, 60)]);
-        res.json({ success: true, versions: r.rows.map(x => ({ id: Number(x.id), name: x.name, tiles: x.tile_count, savedAt: x.saved_at })) });
+        const r = await pool.query("SELECT v.id, v.name, v.tile_count, v.saved_at, EXISTS (SELECT 1 FROM cloud_audio a WHERE a.sha = v.audio_sha) AS has_audio FROM cloud_level_versions v WHERE v.owner_id = $1 AND v.local_id = $2 ORDER BY v.id DESC", [req.query.owner, String(req.query.local || "").slice(0, 60)]);
+        res.json({ success: true, versions: r.rows.map(x => ({ id: Number(x.id), name: x.name, tiles: x.tile_count, savedAt: x.saved_at, audio: x.has_audio })) });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load versions" }); }
 });
 app.get("/api/admin/device-versions/:id", requireAdmin, async (req, res) => {
     try {
-        const r = await pool.query("SELECT owner, name, data FROM cloud_level_versions WHERE id = $1", [Number(req.params.id) || 0]);
+        const r = await pool.query("SELECT owner, name, data, audio_sha FROM cloud_level_versions WHERE id = $1", [Number(req.params.id) || 0]);
         if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
-        res.json({ success: true, owner: r.rows[0].owner, level: r.rows[0].data });
+        res.json({ success: true, owner: r.rows[0].owner, level: Object.assign({}, r.rows[0].data, r.rows[0].audio_sha ? { audioSha: r.rows[0].audio_sha } : {}) });
     } catch (e) { res.status(500).json({ success: false, message: "Could not open it" }); }
 });
 app.delete("/api/admin/unpublished/:id", requireAdmin, async (req, res) => {
