@@ -1549,6 +1549,24 @@ app.get("/api/admin/device-versions/:id", requireAdmin, async (req, res) => {
         res.json({ success: true, owner: r.rows[0].owner, level: Object.assign({}, r.rows[0].data, r.rows[0].audio_sha ? { audioSha: r.rows[0].audio_sha } : {}) });
     } catch (e) { res.status(500).json({ success: false, message: "Could not open it" }); }
 });
+app.post("/api/admin/device-versions/:id/publish", requireAdmin, async (req, res) => {
+    try {
+        const c = (await pool.query("SELECT v.*, u.username AS current_name FROM cloud_level_versions v JOIN users u ON u.id = v.owner_id WHERE v.id = $1", [Number(req.params.id) || 0])).rows[0];
+        if (!c) return res.status(404).json({ success: false, message: "Not found" });
+        const clean = sanitizeLevel(c.data);
+        if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        const row = (await pool.query(
+            `INSERT INTO levels (name, author_id, author, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta)
+             VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9,$10,$11,$12::jsonb) RETURNING *`,
+            [clean.name, c.owner_id, c.current_name, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects), clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)])).rows[0];
+        let audioUrl = null;
+        if (c.audio_sha) { const a = (await pool.query("SELECT mime, data FROM cloud_audio WHERE sha = $1", [c.audio_sha])).rows[0]; if (a) { const url = "data:" + a.mime + ";base64," + a.data.toString("base64"); if (url.length <= 8600000) audioUrl = url; } }
+        await setLevelAudio(row.id, audioUrl, clean.decor);
+        await pool.query("UPDATE cloud_levels SET published_id = $3 WHERE owner_id = $1 AND local_id = $2", [c.owner_id, c.local_id, row.id]);
+        adminLog(req.auth.username, "publish_for", c.current_name, c.name);
+        res.json({ success: true, music: !!audioUrl, level: publicLevel(row) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not publish it" }); }
+});
 app.delete("/api/admin/unpublished/:id", requireAdmin, async (req, res) => {
     try { await pool.query("DELETE FROM cloud_levels WHERE id = $1", [Number(req.params.id) || 0]); res.json({ success: true }); }
     catch (e) { res.status(500).json({ success: false, message: "Could not delete" }); }
