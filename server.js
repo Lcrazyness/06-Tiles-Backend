@@ -230,6 +230,23 @@ async function initializeDatabase() {
     // music of device levels: stored once per file (by SHA-256), levels and versions just point at it
     await pool.query("ALTER TABLE cloud_levels ADD COLUMN IF NOT EXISTS audio_sha CHAR(64)");
     await pool.query("ALTER TABLE cloud_level_versions ADD COLUMN IF NOT EXISTS audio_sha CHAR(64)");
+    // ---- social features: ghosts/replays, packs & playlists, challenges, activity feed, notifications ----
+    await pool.query(`CREATE TABLE IF NOT EXISTS replays (user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE,
+        pct INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0, completed BOOLEAN NOT NULL DEFAULT FALSE, data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (user_id, level_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS packs (id BIGSERIAL PRIMARY KEY, kind VARCHAR(10) NOT NULL DEFAULT 'playlist', name VARCHAR(60) NOT NULL, description VARCHAR(200) NOT NULL DEFAULT '',
+        owner_id UUID REFERENCES users(id) ON DELETE CASCADE, owner VARCHAR(20) NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS pack_levels (pack_id BIGINT NOT NULL REFERENCES packs(id) ON DELETE CASCADE, level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE, position INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pack_id, level_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS challenge_scores (period VARCHAR(1) NOT NULL, period_key VARCHAR(10) NOT NULL, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, level_id UUID NOT NULL,
+        pct INTEGER NOT NULL DEFAULT 0, score INTEGER NOT NULL DEFAULT 0, completed BOOLEAN NOT NULL DEFAULT FALSE, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (period, period_key, user_id))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS weekly_claims (user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, week DATE NOT NULL, level_id UUID, PRIMARY KEY (user_id, week))`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS activity (id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, username VARCHAR(20) NOT NULL, type VARCHAR(10) NOT NULL,
+        level_id UUID, level_name VARCHAR(80) NOT NULL DEFAULT '', data JSONB NOT NULL DEFAULT '{}', dedupe VARCHAR(90) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE (user_id, dedupe))`);
+    await pool.query("CREATE INDEX IF NOT EXISTS activity_time_idx ON activity (created_at DESC)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS notifications (id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, type VARCHAR(12) NOT NULL, text VARCHAR(240) NOT NULL,
+        level_id UUID, dedupe VARCHAR(90) NOT NULL, read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE (user_id, dedupe))`);
+    await pool.query("CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, read, created_at DESC)");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_activity BOOLEAN NOT NULL DEFAULT FALSE");
+    await pool.query("ALTER TABLE vods ADD COLUMN IF NOT EXISTS thumb BYTEA");
     await pool.query(`CREATE TABLE IF NOT EXISTS cloud_audio (sha CHAR(64) PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, mime VARCHAR(60) NOT NULL, size INTEGER NOT NULL, data BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query(`INSERT INTO cloud_level_versions (owner_id, owner, local_id, name, data, tile_count, saved_at)
         SELECT c.owner_id, c.owner, c.local_id, c.name, c.data, c.tile_count, c.updated_at FROM cloud_levels c
@@ -367,7 +384,7 @@ const LEVEL_SUMMARY_COLUMNS = `id, name, author_id, author, icon, lives, fps, au
     CASE WHEN jsonb_typeof(level_data) = 'array' THEN jsonb_array_length(level_data) ELSE 0 END AS tile_count, (audio IS NOT NULL) AS has_audio`;
 
 // ---- global settings the admins can change (stored as JSON in app_meta) ----
-const DEFAULT_SETTINGS = { maxBpm: 500, announcement: "", dailyBonusStars: 3, commentsOpen: true, registrationOpen: true, dailyOverride: null, listMaxPoints: 250 };
+const DEFAULT_SETTINGS = { maxBpm: 500, announcement: "", dailyBonusStars: 3, weeklyBonusStars: 10, weeklyOverride: null, commentsOpen: true, registrationOpen: true, dailyOverride: null, listMaxPoints: 250 };
 let appSettings = Object.assign({}, DEFAULT_SETTINGS);
 async function loadAppSettings() {
     try {
@@ -380,6 +397,30 @@ function adminLog(adminName, action, target, detail) { pool.query("INSERT INTO a
 async function setLevelAudio(id, audio, decor) {
     await pool.query("UPDATE levels SET audio = $2 WHERE id = $1", [id, audio || null]);
     if (decor !== undefined) await pool.query("UPDATE levels SET decor = $2::jsonb WHERE id = $1", [id, decor ? JSON.stringify(decor) : null]);
+}
+
+// ---- notifications + activity feed helpers (never block the request that caused them) ----
+function notify(userId, type, text, opts) {
+    opts = opts || {};
+    if (!userId || !opts.dedupe) return;
+    pool.query(`INSERT INTO notifications (user_id, type, text, level_id, dedupe) VALUES ($1,$2,$3,$4,$5)
+        ON CONFLICT (user_id, dedupe) DO UPDATE SET text = EXCLUDED.text, read = FALSE, created_at = NOW()`, [userId, type, String(text).slice(0, 240), opts.levelId && isUuid(opts.levelId) ? opts.levelId : null, String(opts.dedupe).slice(0, 90)])
+        .then(() => { socketsOf(userId).forEach(sk => sk.emit("notify", { type, text: String(text).slice(0, 240) })); if (Math.random() < 0.02) pool.query("DELETE FROM notifications WHERE created_at < NOW() - INTERVAL '60 days'").catch(() => {}); })
+        .catch(e => console.error("notify", e.message));
+}
+function logActivity(userId, username, type, levelId, levelName, data, dedupe) {
+    pool.query(`INSERT INTO activity (user_id, username, type, level_id, level_name, data, dedupe)
+        SELECT id, $2, $3, $4, $5, $6::jsonb, $7 FROM users WHERE id = $1 AND NOT hide_activity
+        ON CONFLICT (user_id, dedupe) DO UPDATE SET data = EXCLUDED.data, created_at = NOW()`, [userId, username, type, levelId, String(levelName || "").slice(0, 80), JSON.stringify(data || {}), String(dedupe).slice(0, 90)])
+        .then(() => { if (Math.random() < 0.02) pool.query("DELETE FROM activity WHERE created_at < NOW() - INTERVAL '30 days'").catch(() => {}); })
+        .catch(e => console.error("activity", e.message));
+}
+const weekStartKey = (d = new Date()) => { const x = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); x.setUTCDate(x.getUTCDate() - ((x.getUTCDay() + 6) % 7)); return x.toISOString().slice(0, 10); };
+async function getWeeklyLevelRow() {
+    const ov = appSettings.weeklyOverride;
+    if (ov && ov.week === weekStartKey() && isUuid(String(ov.id))) { const o = await pool.query(`SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels WHERE id = $1`, [ov.id]); if (o.rows.length) return o.rows[0]; }
+    const r = await pool.query(`SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels WHERE featured = TRUE ORDER BY md5(id::text || 'w' || $1) LIMIT 1`, [weekStartKey()]);
+    return r.rows[0] || null;
 }
 
 function publicLevel(row, full = false) {
@@ -733,11 +774,29 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
                          ON CONFLICT (user_id, level_id) DO UPDATE SET best_pct = GREATEST(level_records.best_pct, EXCLUDED.best_pct),
                             best_score = GREATEST(level_records.best_score, EXCLUDED.best_score), completed = level_records.completed OR EXCLUDED.completed, updated_at = NOW()`,
                         [me, levelId, pct, score, completed]);
+                    try {   // daily / weekly challenge boards + friends' activity
+                        const dRow = await getDailyLevelRow(), wRow = await getWeeklyLevelRow();
+                        for (const [per, key, row2] of [["d", todayKey(), dRow], ["w", weekStartKey(), wRow]]) {
+                            if (!row2 || row2.id !== levelId) continue;
+                            await pool.query(`INSERT INTO challenge_scores (period, period_key, user_id, level_id, pct, score, completed) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                                ON CONFLICT (period, period_key, user_id) DO UPDATE SET pct = GREATEST(challenge_scores.pct, EXCLUDED.pct), score = GREATEST(challenge_scores.score, EXCLUDED.score),
+                                    completed = challenge_scores.completed OR EXCLUDED.completed, updated_at = NOW()`, [per, key, me, levelId, pct, score, completed]);
+                        }
+                        if (completed) logActivity(me, req.auth.username, "beat", levelId, row.name, { score }, "beat:" + levelId);
+                        else logActivity(me, req.auth.username, "played", levelId, row.name, { pct }, "played:" + levelId + ":" + todayKey());
+                    } catch (e) { console.error("challenge score", e.message); }
                     if (completed) {
                         await pool.query(
                             `INSERT INTO level_completions (user_id, level_id, best_score) VALUES ($1, $2, $3)
                              ON CONFLICT (user_id, level_id) DO UPDATE SET best_score = GREATEST(level_completions.best_score, EXCLUDED.best_score), completed_at = NOW()`,
                             [me, levelId, score]);
+                        try {
+                            const weekly = await getWeeklyLevelRow();
+                            if (weekly && weekly.id === levelId) {
+                                const wc = await pool.query("INSERT INTO weekly_claims (user_id, week, level_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING week", [me, weekStartKey(), levelId]);
+                                if (wc.rows.length) await pool.query("UPDATE users SET bonus_stars = bonus_stars + $2 WHERE id = $1", [me, appSettings.weeklyBonusStars]);
+                            }
+                        } catch (e) { console.error("weekly claim", e.message); }
                         const daily = await getDailyLevelRow();
                         if (daily && daily.id === levelId) {
                             const claim = await pool.query("INSERT INTO daily_claims (user_id, day, level_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING day", [me, todayKey(), levelId]);
@@ -765,10 +824,10 @@ app.get("/api/levels/:id/leaderboard", async (req, res) => {
     try {
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const r = await pool.query(
-            `SELECT u.username, u.profile_icon, u.cosmetics, r.best_pct, r.best_score, r.completed FROM level_records r JOIN users u ON u.id = r.user_id
+            `SELECT u.username, u.profile_icon, u.cosmetics, r.best_pct, r.best_score, r.completed, EXISTS (SELECT 1 FROM replays p WHERE p.user_id = r.user_id AND p.level_id = r.level_id) AS has_replay FROM level_records r JOIN users u ON u.id = r.user_id
              WHERE r.level_id = $1 AND (u.banned_until IS NULL OR u.banned_until < NOW())
              ORDER BY r.completed DESC, r.best_pct DESC, r.best_score DESC LIMIT 25`, [req.params.id]);
-        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.best_pct, score: Number(x.best_score), completed: x.completed })) });
+        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.best_pct, score: Number(x.best_score), completed: x.completed, hasReplay: x.has_replay })) });
     } catch (error) { res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
 });
 
@@ -874,6 +933,13 @@ app.post("/api/levels/:id/comments", authenticate, rateLimit("comment", 40, 60 *
         }
         const r = await pool.query("INSERT INTO level_comments (level_id, user_id, username, text, parent_id) SELECT id, $2, $3, $4, $5 FROM levels WHERE id = $1 RETURNING id", [req.params.id, req.auth.userId, req.auth.username, text, parent]);
         if (!r.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+        try {
+            const lv = (await pool.query("SELECT name, author_id FROM levels WHERE id = $1", [req.params.id])).rows[0];
+            if (parent) {
+                const po = (await pool.query("SELECT user_id FROM level_comments WHERE id = $1", [parent])).rows[0];
+                if (po && po.user_id !== req.auth.userId) notify(po.user_id, "reply", req.auth.username + " replied to your comment on \"" + lv.name + "\"", { levelId: req.params.id, dedupe: "reply:" + r.rows[0].id });
+            } else if (lv && lv.author_id !== req.auth.userId) notify(lv.author_id, "comment", req.auth.username + " commented on your level \"" + lv.name + "\"", { levelId: req.params.id, dedupe: "comment:" + r.rows[0].id });
+        } catch (e) { console.error("notify comment", e.message); }
         res.json({ success: true, id: Number(r.rows[0].id) });
     } catch (error) { console.error("Comment post error:", error); res.status(500).json({ success: false, message: "Could not post comment" }); }
 });
@@ -888,6 +954,7 @@ app.post("/api/comments/:id/like", authenticate, rateLimit("clike", 300, 60 * 60
             liked = true;
         }
         const n = await pool.query("SELECT COUNT(*)::int AS n FROM comment_likes WHERE comment_id = $1", [id]);
+        if (liked) pool.query("SELECT c.user_id, c.level_id, l.name FROM level_comments c JOIN levels l ON l.id = c.level_id WHERE c.id = $1", [id]).then(q => { const c = q.rows[0]; if (c && c.user_id !== req.auth.userId) notify(c.user_id, "like", req.auth.username + " liked your comment on \"" + c.name + "\"", { levelId: c.level_id, dedupe: "clike:" + id + ":" + req.auth.userId }); }).catch(() => {});
         res.json({ success: true, liked, likes: n.rows[0].n });
     } catch (error) { console.error("Like error:", error); res.status(500).json({ success: false, message: "Could not like that" }); }
 });
@@ -945,10 +1012,11 @@ app.post("/api/friends/request", authenticate, rateLimit("friendreq", 30, 60 * 6
         if (existing.rows.length) {
             const e = existing.rows[0];
             if (e.status === "accepted") return res.status(400).json({ success: false, message: "You're already friends." });
-            if (e.user_id === other) { await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, me]); return res.json({ success: true, accepted: true }); }
+            if (e.user_id === other) { await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, me]); notify(other, "friend", req.auth.username + " accepted your friend request", { dedupe: "fra:" + me }); return res.json({ success: true, accepted: true }); }
             return res.status(400).json({ success: false, message: "Request already sent." });
         }
         await pool.query("INSERT INTO friendships (user_id, friend_id) VALUES ($1,$2)", [me, other]);
+        notify(other, "friend", req.auth.username + " sent you a friend request", { dedupe: "fr:" + me });
         socketsOf(other).forEach(sk => sk.emit("friend_request", { from: req.auth.username }));
         res.json({ success: true });
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not send the request" }); }
@@ -957,7 +1025,7 @@ app.post("/api/friends/respond", authenticate, async (req, res) => {
     try {
         const other = String(req.body.userId || "");
         if (!isUuid(other)) return res.status(404).json({ success: false });
-        if (req.body.accept) await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, req.auth.userId]);
+        if (req.body.accept) { await pool.query("UPDATE friendships SET status = 'accepted' WHERE user_id = $1 AND friend_id = $2", [other, req.auth.userId]); notify(other, "friend", req.auth.username + " accepted your friend request", { dedupe: "fra:" + req.auth.userId }); }
         else await pool.query("DELETE FROM friendships WHERE user_id = $1 AND friend_id = $2", [other, req.auth.userId]);
         res.json({ success: true });
     } catch (error) { res.status(500).json({ success: false, message: "Could not update the request" }); }
@@ -1050,6 +1118,7 @@ app.post("/api/levels", authenticate, rateLimit("publish", 20, 60 * 60 * 1000), 
              clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)]
         );
         await setLevelAudio(result.rows[0].id, clean.audio, clean.decor);
+        logActivity(req.auth.userId, req.auth.username, "publish", result.rows[0].id, clean.name, {}, "pub:" + result.rows[0].id);
         res.status(201).json({ success: true, level: publicLevel(result.rows[0]) });
     } catch (error) {
         console.error("Level publish error:", error);
@@ -1097,6 +1166,7 @@ app.post("/api/levels/:id/rate", authenticate, async (req, res) => {
             );
         }
         await client.query("COMMIT");
+        if (lv.author_id !== req.auth.userId) notify(lv.author_id, "rate", req.auth.username + " rated your level \"" + lv.name + "\" " + stars + " star" + (stars === 1 ? "" : "s"), { levelId: req.params.id, dedupe: "rate:" + req.params.id + ":" + req.auth.userId });
         const row = result.rows[0];
         res.json({ success: true, ratingAverage: row.rating_count ? row.rating_total / row.rating_count : 0, ratingCount: row.rating_count });
     } catch (error) {
@@ -1151,11 +1221,26 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
 
 // Update one of YOUR published levels in place (ratings, plays, rated status and completions are kept).
 // Rated levels also ping the admin so they can re-check the change.
+// a "nerf-only" update: every tile is unchanged from the published version (tiles may only be removed) and the
+// gameplay effects (speed/hitbox/lane flip) are identical. Music and decoration may change freely.
+function isNerfOnly(oldNotes, oldEffects, newNotes, newEffects) {
+    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0].join("|");
+    const have = new Set((oldNotes || []).map(key));
+    if (!(newNotes || []).every(n => have.has(key(n)))) return false;
+    const fx = e => JSON.stringify((e || []).filter(x => x && ["speed", "hitbox", "laneflip"].includes(x.type)));
+    return fx(oldEffects) === fx(newEffects);
+}
 app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000), async (req, res) => {
     try {
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const clean = sanitizeLevel(req.body);
         if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        if (req.body && req.body.nerfOnly) {
+            const prev = (await pool.query("SELECT level_data, effects FROM levels WHERE id=$1 AND author_id=$2", [req.params.id, req.auth.userId])).rows[0];
+            if (prev && !isNerfOnly(prev.level_data, prev.effects, clean.notes, clean.effects)) {
+                return res.status(400).json({ success: false, message: "That update changes more than removing tiles or music, so it has to be beaten again." });
+            }
+        }
         await snapshotLevel(req.params.id, req.auth.userId);
         const result = await pool.query(
             `UPDATE levels SET name=$3, icon=$4, level_data=$5::jsonb, effects=$6::jsonb, lives=$7, fps=$8, audio_offset=$9,
@@ -1387,6 +1472,7 @@ app.post("/api/news/:id/comments", authenticate, rateLimit("ncomment", 40, 60 * 
         }
         const r = await pool.query("INSERT INTO news_comments (news_id, user_id, username, text, parent_id) SELECT id, $2, $3, $4, $5 FROM news WHERE id = $1 RETURNING id", [nid, req.auth.userId, req.auth.username, text, parent]);
         if (!r.rows.length) return res.status(404).json({ success: false, message: "Post not found" });
+        if (parent) pool.query("SELECT user_id FROM news_comments WHERE id = $1", [parent]).then(q => { const o = q.rows[0]; if (o && o.user_id !== req.auth.userId) notify(o.user_id, "reply", req.auth.username + " replied to your comment on an announcement", { dedupe: "nreply:" + r.rows[0].id }); }).catch(() => {});
         res.json({ success: true, id: Number(r.rows[0].id) });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not post" }); }
 });
@@ -1681,6 +1767,7 @@ app.put("/api/admin/settings", requireAdmin, async (req, res) => {
         if (b.maxBpm !== undefined) appSettings.maxBpm = clampInt(b.maxBpm, 60, 2000, 500);
         if (b.announcement !== undefined) appSettings.announcement = String(b.announcement).slice(0, 300);
         if (b.dailyBonusStars !== undefined) appSettings.dailyBonusStars = clampInt(b.dailyBonusStars, 0, 50, 3);
+        if (b.weeklyBonusStars !== undefined) appSettings.weeklyBonusStars = clampInt(b.weeklyBonusStars, 0, 200, 10);
         if (b.commentsOpen !== undefined) appSettings.commentsOpen = !!b.commentsOpen;
         if (b.registrationOpen !== undefined) appSettings.registrationOpen = !!b.registrationOpen;
         if (b.listMaxPoints !== undefined) {
@@ -1921,6 +2008,7 @@ app.patch("/api/admin/levels/:id/rate", requireAdmin, async (req, res) => {
         );
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
         if (rated) await pool.query("UPDATE admin_notifications SET read = TRUE WHERE level_id = $1", [req.params.id]);
+        if (rated && result.rows[0].author_id && result.rows[0].author_id !== req.auth.userId) notify(result.rows[0].author_id, "featured", "Your level \"" + result.rows[0].name + "\" was featured and rated " + stars + " star" + (stars === 1 ? "" : "s") + "!", { levelId: req.params.id, dedupe: "feat:" + req.params.id });
         adminLog(req.auth.username, "rate", result.rows[0].name, rated ? stars + " stars, " + (difficulty || result.rows[0].difficulty) : "rating removed");
         res.json({ success: true, level: publicLevel(result.rows[0]) });
     } catch (error) {
@@ -2429,13 +2517,13 @@ function endStream(st, reason) {
 // A view counts once per viewer per day; "Popular" sorts by views, "Most liked" by likes.
 // ---------------------------------------------------------------------------
 const VOD_MAX_BYTES = 60 * 1024 * 1024, VOD_MAX_PER_USER = 10;
-const vodRow = (v, liked) => ({ id: Number(v.id), username: v.username, title: v.title, levelLabel: v.level_label, format: v.format, duration: v.duration, size: v.size, views: v.views, likes: v.likes || 0, liked: !!liked, createdAt: v.created_at });
+const vodRow = (v, liked) => ({ thumb: v.has_thumb ? "/api/vods/" + Number(v.id) + "/thumb" : null, id: Number(v.id), username: v.username, title: v.title, levelLabel: v.level_label, format: v.format, duration: v.duration, size: v.size, views: v.views, likes: v.likes || 0, liked: !!liked, createdAt: v.created_at });
 app.get("/api/vods", async (req, res) => {
     try {
         const sort = String(req.query.sort || "recent");
         const order = sort === "popular" ? "v.views DESC, v.created_at DESC" : sort === "liked" ? "likes DESC, v.created_at DESC" : "v.created_at DESC";
         const me = optionalUserId(req);
-        const r = await pool.query(`SELECT v.id, v.username, v.title, v.level_label, v.format, v.duration, v.size, v.views, v.created_at,
+        const r = await pool.query(`SELECT v.id, v.username, v.title, v.level_label, v.format, v.duration, v.size, v.views, v.created_at, (v.thumb IS NOT NULL) AS has_thumb,
                 (SELECT COUNT(*) FROM vod_likes k WHERE k.vod_id = v.id)::int AS likes,
                 EXISTS (SELECT 1 FROM vod_likes k WHERE k.vod_id = v.id AND k.user_id = $1) AS liked
             FROM vods v ORDER BY ${order} LIMIT 50`, [me]);
@@ -2514,7 +2602,21 @@ app.delete("/api/vods/:id", authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: "Could not delete" }); }
 });
 
-app.get("/api/streams", (req, res) => res.json({ success: true, streams: streamList() }));
+app.get("/api/streams", (req, res) => res.json({ success: true, streams: [...streams.values()].map(st => Object.assign(streamPublic(st), { thumb: st.thumb || null })).sort((a, b) => b.viewers - a.viewers || a.startedAt - b.startedAt) }));
+app.put("/api/vods/:id/thumb", authenticate, express.raw({ type: () => true, limit: "200kb" }), async (req, res) => {
+    try {
+        if (!Buffer.isBuffer(req.body) || req.body.length < 200 || req.body.length > 180000) return res.status(400).json({ success: false, message: "Bad picture" });
+        const r = await pool.query("UPDATE vods SET thumb = $3 WHERE id = $1 AND user_id = $2 RETURNING id", [clampInt(req.params.id, 1, 9e15, 0), req.auth.userId, req.body]);
+        res.json({ success: r.rows.length > 0 });
+    } catch (e) { res.status(500).json({ success: false }); }
+});
+app.get("/api/vods/:id/thumb", async (req, res) => {
+    try {
+        const r = await pool.query("SELECT thumb FROM vods WHERE id = $1", [clampInt(req.params.id, 1, 9e15, 0)]);
+        if (!r.rows.length || !r.rows[0].thumb) return res.status(404).end();
+        res.set({ "Content-Type": "image/jpeg", "Cache-Control": "public, max-age=86400" }).send(r.rows[0].thumb);
+    } catch (e) { res.status(500).end(); }
+});
 app.get("/api/streams/config", (req, res) => {
     const iceServers = [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }];
     if (process.env.TURN_URL) iceServers.push({ urls: String(process.env.TURN_URL).split(","), username: process.env.TURN_USER || "", credential: process.env.TURN_PASS || "" });
@@ -2590,6 +2692,10 @@ io.on("connection", socket => {
             socket.emit("stream_started", Object.assign(streamPublic(st), { key: st.key }));
             io.emit("streams_changed", streamList());
         } catch (e) { console.error("stream_start", e); socket.emit("stream_error", { message: "Could not start the stream." }); }
+    });
+    socket.on("stream_thumb", img => {
+        const st = myStream(); if (!st || typeof img !== "string" || !/^data:image\/jpeg;base64,/.test(img) || img.length > 70000) return;
+        st.thumb = img;
     });
     socket.on("stream_update", payload => {
         const st = myStream(); if (!st) return;
@@ -2827,6 +2933,209 @@ io.on("connection", socket => {
         }
         schedulePresence();
     });
+});
+
+// ===========================================================================
+// GHOSTS / REPLAYS, CHALLENGES, PACKS & PLAYLISTS, ACTIVITY FEED, NOTIFICATIONS
+// ===========================================================================
+const cleanReplay = d => {
+    if (!d || typeof d !== "object") return null;
+    const n = (v, hi) => Math.max(0, Math.min(hi, Math.round(Number(v) || 0)));
+    return {
+        v: 1,
+        h: (Array.isArray(d.h) ? d.h : []).slice(0, 8000).map(x => Array.isArray(x) ? [n(x[0], 36e5), n(x[1], 20000), n(x[2], 3)] : [0, 0, 0]),
+        w: (Array.isArray(d.w) ? d.w : []).slice(0, 200).map(x => n(x, 36e5)),
+        end: n(d.end, 36e5), died: d.died ? String(d.died).slice(0, 30) : null
+    };
+};
+app.post("/api/levels/:id/replay", authenticate, rateLimit("replay", 150, 60 * 60 * 1000), async (req, res) => {
+    try {
+        if (!isUuid(req.params.id) || req.auth.imp) return res.json({ success: true, saved: false });
+        const data = cleanReplay(req.body.data);
+        if (!data || !data.h.length) return res.json({ success: true, saved: false });
+        const pct = clampInt(req.body.pct, 0, 100, 0), score = clampInt(req.body.score, 0, 1e9, 0), completed = !!req.body.completed;
+        const r = await pool.query(`INSERT INTO replays (user_id, level_id, pct, score, completed, data) SELECT $1, id, $3, $4, $5, $6::jsonb FROM levels WHERE id = $2
+            ON CONFLICT (user_id, level_id) DO UPDATE SET pct = EXCLUDED.pct, score = EXCLUDED.score, completed = EXCLUDED.completed, data = EXCLUDED.data, created_at = NOW()
+            WHERE (EXCLUDED.completed, EXCLUDED.pct, EXCLUDED.score) > (replays.completed, replays.pct, replays.score) RETURNING 1`, [req.auth.userId, req.params.id, pct, score, completed, JSON.stringify(data)]);
+        res.json({ success: true, saved: r.rows.length > 0 });
+    } catch (e) { console.error("replay save", e.message); res.status(500).json({ success: false }); }
+});
+app.get("/api/levels/:id/ghost", async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const who = String(req.query.who || "top").slice(0, 20);
+        const r = who === "top"
+            ? await pool.query(`SELECT u.username, p.pct, p.score, p.completed, p.data FROM replays p JOIN users u ON u.id = p.user_id WHERE p.level_id = $1 AND (u.banned_until IS NULL OR u.banned_until < NOW())
+                ORDER BY p.completed DESC, p.pct DESC, p.score DESC LIMIT 1`, [req.params.id])
+            : await pool.query(`SELECT u.username, p.pct, p.score, p.completed, p.data FROM replays p JOIN users u ON u.id = p.user_id WHERE p.level_id = $1 AND LOWER(u.username) = LOWER($2)`, [req.params.id, who]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "No replay saved for that player yet." });
+        const x = r.rows[0];
+        res.json({ success: true, ghost: { username: x.username, pct: x.pct, score: x.score, completed: x.completed, data: x.data } });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not load the replay" }); }
+});
+
+// ---- daily + weekly challenge ----
+const nextUtcMidnight = () => { const d = new Date(); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1); };
+const nextMonday = () => { const d = new Date(weekStartKey() + "T00:00:00Z"); return d.getTime() + 7 * 86400000; };
+app.get("/api/challenges", async (req, res) => {
+    try {
+        const me = optionalUserId(req);
+        const [dRow, wRow] = [await getDailyLevelRow(), await getWeeklyLevelRow()];
+        const claimed = async (tbl, col, key) => me ? (await pool.query(`SELECT 1 FROM ${tbl} WHERE user_id = $1 AND ${col} = $2`, [me, key])).rows.length > 0 : false;
+        res.json({ success: true,
+            daily: { level: dRow ? publicLevel(dRow) : null, bonusStars: appSettings.dailyBonusStars, claimed: await claimed("daily_claims", "day", todayKey()), endsAt: nextUtcMidnight() },
+            weekly: { level: wRow ? publicLevel(wRow) : null, bonusStars: appSettings.weeklyBonusStars, claimed: await claimed("weekly_claims", "week", weekStartKey()), endsAt: nextMonday() } });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the challenges" }); }
+});
+app.get("/api/challenges/:kind/leaderboard", async (req, res) => {
+    try {
+        const per = req.params.kind === "weekly" ? "w" : req.params.kind === "daily" ? "d" : null;
+        if (!per) return res.status(404).json({ success: false });
+        const key = per === "w" ? weekStartKey() : todayKey(), me = optionalUserId(req);
+        const r = await pool.query(`SELECT * FROM (SELECT c.user_id, u.username, u.profile_icon, u.cosmetics, c.pct, c.score, c.completed,
+                RANK() OVER (ORDER BY c.completed DESC, c.pct DESC, c.score DESC) AS rank
+            FROM challenge_scores c JOIN users u ON u.id = c.user_id WHERE c.period = $1 AND c.period_key = $2 AND (u.banned_until IS NULL OR u.banned_until < NOW())) x ORDER BY rank, score DESC LIMIT 25`, [per, key]);
+        let mine = null;
+        if (me) { const m = await pool.query(`SELECT * FROM (SELECT c.user_id, c.pct, c.score, c.completed, RANK() OVER (ORDER BY c.completed DESC, c.pct DESC, c.score DESC) AS rank FROM challenge_scores c WHERE c.period = $1 AND c.period_key = $2) x WHERE user_id = $3`, [per, key, me]); if (m.rows[0]) mine = { rank: Number(m.rows[0].rank), pct: m.rows[0].pct, score: m.rows[0].score, completed: m.rows[0].completed }; }
+        res.json({ success: true, entries: r.rows.map(x => ({ rank: Number(x.rank), username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.pct, score: x.score, completed: x.completed, me: x.user_id === me })), mine });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
+});
+app.post("/api/admin/weekly", requireAdmin, async (req, res) => {
+    try {
+        if (req.body.levelId === null) appSettings.weeklyOverride = null;
+        else {
+            if (!isUuid(req.body.levelId)) return res.status(400).json({ success: false, message: "Pick a level" });
+            const l = await pool.query("SELECT name FROM levels WHERE id = $1", [req.body.levelId]);
+            if (!l.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
+            appSettings.weeklyOverride = { week: weekStartKey(), id: req.body.levelId };
+            adminLog(req.auth.username, "weekly", l.rows[0].name, "set weekly level");
+        }
+        await saveAppSettings();
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not set the weekly level" }); }
+});
+
+// ---- packs (official, admin-made) and playlists (anyone) ----
+const PACK_MAX_LEVELS = 60, PLAYLIST_MAX_PER_USER = 10;
+const packOwnerOk = async (req, pack) => pack && (pack.owner_id === req.auth.userId || await checkAdmin(req.auth.userId));
+app.get("/api/packs", async (req, res) => {
+    try {
+        const me = optionalUserId(req), kind = String(req.query.kind || "pack");
+        const where = kind === "mine" ? "p.owner_id = $1" : kind === "playlist" ? "p.kind = 'playlist'" : "p.kind = 'pack'";
+        const r = await pool.query(`SELECT p.id, p.kind, p.name, p.description, p.owner, p.owner_id, p.updated_at,
+                (SELECT COUNT(*) FROM pack_levels x WHERE x.pack_id = p.id)::int AS levels,
+                (SELECT COUNT(*) FROM pack_levels x JOIN level_records r ON r.level_id = x.level_id AND r.user_id = $1 AND r.completed WHERE x.pack_id = p.id)::int AS done
+            FROM packs p WHERE ${where} ORDER BY p.updated_at DESC LIMIT 100`, [me]);
+        res.json({ success: true, packs: r.rows.map(x => ({ id: Number(x.id), kind: x.kind, name: x.name, description: x.description, owner: x.owner, mine: !!me && x.owner_id === me, levels: x.levels, done: x.done, updatedAt: x.updated_at })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load packs" }); }
+});
+app.get("/api/packs/:id", async (req, res) => {
+    try {
+        const me = optionalUserId(req), id = clampInt(req.params.id, 1, 9e15, 0);
+        const p = (await pool.query("SELECT id, kind, name, description, owner, owner_id FROM packs WHERE id = $1", [id])).rows[0];
+        if (!p) return res.status(404).json({ success: false, message: "Not found" });
+        const order = (await pool.query("SELECT level_id FROM pack_levels WHERE pack_id = $1 ORDER BY position, level_id", [id])).rows.map(x => x.level_id);
+        const rows = order.length ? (await pool.query(`SELECT ${LEVEL_SUMMARY_COLUMNS} FROM levels WHERE id = ANY($1::uuid[])`, [order])).rows : [];
+        const byId = new Map(rows.map(x => [x.id, x]));
+        const prog = me && order.length ? new Map((await pool.query("SELECT level_id, best_pct, completed FROM level_records WHERE user_id = $1 AND level_id = ANY($2::uuid[])", [me, order])).rows.map(x => [x.level_id, x])) : new Map();
+        const levels = order.filter(l => byId.has(l)).map(l => Object.assign(publicLevel(byId.get(l)), { myPct: prog.has(l) ? prog.get(l).best_pct : 0, myDone: prog.has(l) ? prog.get(l).completed : false }));
+        res.json({ success: true, pack: { id: Number(p.id), kind: p.kind, name: p.name, description: p.description, owner: p.owner, mine: !!me && p.owner_id === me, levels } });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not open it" }); }
+});
+app.post("/api/packs", authenticate, rateLimit("packnew", 30, 60 * 60 * 1000), async (req, res) => {
+    try {
+        if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted." });
+        const kind = req.body.kind === "pack" ? "pack" : "playlist", name = String(req.body.name || "").trim().slice(0, 60), description = String(req.body.description || "").trim().slice(0, 200);
+        if (name.length < 2) return res.status(400).json({ success: false, message: "Give it a name." });
+        if (kind === "pack" && !(await checkAdmin(req.auth.userId))) return res.status(403).json({ success: false, message: "Only admins make official packs." });
+        if (kind === "playlist" && Number((await pool.query("SELECT COUNT(*) AS n FROM packs WHERE owner_id = $1 AND kind = 'playlist'", [req.auth.userId])).rows[0].n) >= PLAYLIST_MAX_PER_USER) return res.status(400).json({ success: false, message: "You can have " + PLAYLIST_MAX_PER_USER + " playlists. Delete one first." });
+        const r = await pool.query("INSERT INTO packs (kind, name, description, owner_id, owner) VALUES ($1,$2,$3,$4,$5) RETURNING id", [kind, name, description, req.auth.userId, req.auth.username]);
+        if (kind === "pack") adminLog(req.auth.username, "pack_new", name, "");
+        res.status(201).json({ success: true, id: Number(r.rows[0].id) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not create it" }); }
+});
+app.put("/api/packs/:id", authenticate, async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), p = (await pool.query("SELECT owner_id FROM packs WHERE id = $1", [id])).rows[0];
+        if (!(await packOwnerOk(req, p))) return res.status(403).json({ success: false, message: "Not yours." });
+        const name = String(req.body.name || "").trim().slice(0, 60), description = String(req.body.description || "").trim().slice(0, 200);
+        if (name.length < 2) return res.status(400).json({ success: false, message: "Give it a name." });
+        await pool.query("UPDATE packs SET name = $2, description = $3, updated_at = NOW() WHERE id = $1", [id, name, description]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not save it" }); }
+});
+app.delete("/api/packs/:id", authenticate, async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), p = (await pool.query("SELECT owner_id, kind, name FROM packs WHERE id = $1", [id])).rows[0];
+        if (!(await packOwnerOk(req, p))) return res.status(403).json({ success: false, message: "Not yours." });
+        await pool.query("DELETE FROM packs WHERE id = $1", [id]);
+        if (p.kind === "pack") adminLog(req.auth.username, "pack_delete", p.name, "");
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not delete it" }); }
+});
+app.post("/api/packs/:id/levels", authenticate, rateLimit("packadd", 200, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), p = (await pool.query("SELECT owner_id FROM packs WHERE id = $1", [id])).rows[0];
+        if (!(await packOwnerOk(req, p))) return res.status(403).json({ success: false, message: "Not yours." });
+        if (!isUuid(req.body.levelId)) return res.status(400).json({ success: false, message: "Pick a level" });
+        const n = Number((await pool.query("SELECT COUNT(*) AS n FROM pack_levels WHERE pack_id = $1", [id])).rows[0].n);
+        if (n >= PACK_MAX_LEVELS) return res.status(400).json({ success: false, message: "That set is full (" + PACK_MAX_LEVELS + " levels)." });
+        const r = await pool.query("INSERT INTO pack_levels (pack_id, level_id, position) SELECT $1, id, $3 FROM levels WHERE id = $2 ON CONFLICT DO NOTHING RETURNING 1", [id, req.body.levelId, n]);
+        await pool.query("UPDATE packs SET updated_at = NOW() WHERE id = $1", [id]);
+        res.json({ success: true, added: r.rows.length > 0 });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not add it" }); }
+});
+app.delete("/api/packs/:id/levels/:levelId", authenticate, async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), p = (await pool.query("SELECT owner_id FROM packs WHERE id = $1", [id])).rows[0];
+        if (!(await packOwnerOk(req, p)) || !isUuid(req.params.levelId)) return res.status(403).json({ success: false, message: "Not yours." });
+        await pool.query("DELETE FROM pack_levels WHERE pack_id = $1 AND level_id = $2", [id, req.params.levelId]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not remove it" }); }
+});
+app.put("/api/packs/:id/order", authenticate, async (req, res) => {
+    try {
+        const id = clampInt(req.params.id, 1, 9e15, 0), p = (await pool.query("SELECT owner_id FROM packs WHERE id = $1", [id])).rows[0];
+        if (!(await packOwnerOk(req, p)) || !Array.isArray(req.body.levelIds)) return res.status(403).json({ success: false, message: "Not yours." });
+        const ids = req.body.levelIds.filter(isUuid).slice(0, PACK_MAX_LEVELS);
+        for (let i = 0; i < ids.length; i++) await pool.query("UPDATE pack_levels SET position = $3 WHERE pack_id = $1 AND level_id = $2", [id, ids[i], i]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not reorder" }); }
+});
+
+// ---- friends' activity feed ----
+app.get("/api/activity", authenticate, async (req, res) => {
+    try {
+        const me = req.auth.userId;
+        const r = await pool.query(`SELECT a.id, a.username, a.type, a.level_id, a.level_name, a.data, a.created_at FROM activity a
+            WHERE a.created_at > NOW() - INTERVAL '14 days' AND a.user_id IN (SELECT CASE WHEN user_id = $1 THEN friend_id ELSE user_id END FROM friendships WHERE status = 'accepted' AND (user_id = $1 OR friend_id = $1))
+            ORDER BY a.created_at DESC LIMIT 60`, [me]);
+        const hide = (await pool.query("SELECT hide_activity FROM users WHERE id = $1", [me])).rows[0];
+        res.json({ success: true, hidden: !!(hide && hide.hide_activity), items: r.rows.map(x => ({ id: Number(x.id), username: x.username, type: x.type, levelId: x.level_id, levelName: x.level_name, data: x.data, at: x.created_at })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the feed" }); }
+});
+app.put("/api/activity/privacy", authenticate, async (req, res) => {
+    try { await pool.query("UPDATE users SET hide_activity = $2 WHERE id = $1", [req.auth.userId, !!req.body.hidden]); res.json({ success: true }); }
+    catch (e) { res.status(500).json({ success: false }); }
+});
+
+// ---- player notifications ----
+app.get("/api/notifications", authenticate, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT id, type, text, level_id, read, created_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50", [req.auth.userId]);
+        res.json({ success: true, unread: r.rows.filter(x => !x.read).length, items: r.rows.map(x => ({ id: Number(x.id), type: x.type, text: x.text, levelId: x.level_id, read: x.read, at: x.created_at })) });
+    } catch (e) { res.status(500).json({ success: false, message: "Could not load alerts" }); }
+});
+app.get("/api/notifications/count", authenticate, async (req, res) => {
+    try { res.json({ success: true, unread: Number((await pool.query("SELECT COUNT(*) AS n FROM notifications WHERE user_id = $1 AND NOT read", [req.auth.userId])).rows[0].n) }); }
+    catch (e) { res.status(500).json({ success: false }); }
+});
+app.post("/api/notifications/read", authenticate, async (req, res) => {
+    try {
+        if (req.body.id) await pool.query("UPDATE notifications SET read = TRUE WHERE user_id = $1 AND id = $2", [req.auth.userId, clampInt(req.body.id, 1, 9e15, 0)]);
+        else await pool.query("UPDATE notifications SET read = TRUE WHERE user_id = $1", [req.auth.userId]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false }); }
 });
 
 async function startServer() {
