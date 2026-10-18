@@ -1225,9 +1225,11 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
 // gameplay effects (speed/hitbox/lane flip) are identical. Music and decoration may change freely.
 function isNerfOnly(oldNotes, oldEffects, newNotes, newEffects) {
     const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0].join("|");
+    const gpRandom = x => x && x.type === "random" && Number(x.gp) === 1 && x.mode !== "reset";
+    if ((newEffects || []).some(gpRandom)) return false;   // removing a tile renumbers tiles, changing a gameplay randomizer's result
     const have = new Set((oldNotes || []).map(key));
     if (!(newNotes || []).every(n => have.has(key(n)))) return false;
-    const fx = e => JSON.stringify((e || []).filter(x => x && ["speed", "hitbox", "laneflip"].includes(x.type)));
+    const fx = e => JSON.stringify((e || []).filter(x => x && (["speed", "hitbox", "laneflip"].includes(x.type) || (x.type === "random" && Number(x.gp) === 1 && x.mode !== "reset"))));
     return fx(oldEffects) === fx(newEffects);
 }
 app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000), async (req, res) => {
@@ -1565,6 +1567,28 @@ app.get("/api/admin/audio/:sha", requireAdmin, async (req, res) => {
         if (!r.rows.length) return res.status(404).json({ success: false, message: "No music saved for this level" });
         res.set({ "Content-Type": r.rows[0].mime, "Cache-Control": "private, max-age=3600" }).send(r.rows[0].data);
     } catch (e) { res.status(500).end(); }
+});
+// a player getting their OWN saved device levels back (e.g. after browser data was cleared)
+app.get("/api/sync/levels", authenticate, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT local_id, name, tile_count, audio_sha, updated_at FROM cloud_levels WHERE owner_id = $1 ORDER BY updated_at DESC LIMIT 500", [req.auth.userId]);
+        res.json({ success: true, levels: r.rows.map(x => ({ localId: x.local_id, name: x.name, tileCount: x.tile_count, audioSha: x.audio_sha ? String(x.audio_sha).trim() : null, updatedAt: x.updated_at })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load your saved levels" }); }
+});
+app.get("/api/sync/levels/:localId", authenticate, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT data FROM cloud_levels WHERE owner_id = $1 AND local_id = $2", [req.auth.userId, String(req.params.localId).slice(0, 60)]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "Not found" });
+        res.json({ success: true, level: r.rows[0].data });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load that level" }); }
+});
+app.get("/api/sync/audio/:sha", authenticate, async (req, res) => {
+    try {
+        if (!/^[0-9a-f]{64}$/.test(String(req.params.sha))) return res.status(400).end();
+        const r = await pool.query("SELECT mime, data FROM cloud_audio WHERE sha = $1 AND owner_id = $2", [req.params.sha, req.auth.userId]);
+        if (!r.rows.length) return res.status(404).json({ success: false, message: "No music saved" });
+        res.set({ "Content-Type": r.rows[0].mime, "Cache-Control": "private, max-age=3600" }).send(r.rows[0].data);
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
 });
 app.delete("/api/sync/levels/:localId", authenticate, async (req, res) => {
     try { await pool.query("DELETE FROM cloud_levels WHERE owner_id = $1 AND local_id = $2", [req.auth.userId, String(req.params.localId).slice(0, 60)]); res.json({ success: true }); }
@@ -3136,6 +3160,80 @@ app.post("/api/notifications/read", authenticate, async (req, res) => {
         else await pool.query("UPDATE notifications SET read = TRUE WHERE user_id = $1", [req.auth.userId]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// ---------------------------------------------------------------------------
+// backup vault (admin only): export every table, paged, and restore it into a new/empty database keeping all ids
+// ---------------------------------------------------------------------------
+const BLOB_TABLES = new Set(["cloud_audio", "vod_blobs", "songs"]);
+async function backupTables() {
+    const t = (await pool.query("SELECT tablename FROM pg_tables WHERE schemaname='public'")).rows.map(r => r.tablename);
+    const deps = new Map(t.map(n => [n, new Set()]));
+    const fk = await pool.query(`SELECT c.conrelid::regclass::text AS child, c.confrelid::regclass::text AS parent FROM pg_constraint c
+        JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype='f' AND n.nspname='public'`);
+    fk.rows.forEach(r => { const c = r.child.replace(/"/g, ""), p = r.parent.replace(/"/g, ""); if (c !== p && deps.has(c) && deps.has(p)) deps.get(c).add(p); });
+    const order = [], done = new Set();
+    while (order.length < t.length) {
+        const ready = t.filter(n => !done.has(n) && [...deps.get(n)].every(d => done.has(d))).sort();
+        if (!ready.length) { t.filter(n => !done.has(n)).sort().forEach(n => { order.push(n); done.add(n); }); break; }
+        ready.forEach(n => { order.push(n); done.add(n); });
+    }
+    const out = [];
+    for (const name of order) {
+        const pk = (await pool.query(`SELECT a.attname FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = $1::regclass AND i.indisprimary ORDER BY a.attnum`, ['"' + name + '"'])).rows.map(r => r.attname);
+        const count = Number((await pool.query('SELECT COUNT(*)::int AS n FROM "' + name + '"')).rows[0].n);
+        out.push({ name, pk, count, blob: BLOB_TABLES.has(name) });
+    }
+    return out;
+}
+app.get("/api/admin/backup/tables", requireAdmin, async (req, res) => {
+    try { res.json({ success: true, tables: await backupTables() }); }
+    catch (e) { console.error("Backup tables error:", e); res.status(500).json({ success: false, message: "Could not list tables" }); }
+});
+app.get("/api/admin/backup/table/:name", requireAdmin, async (req, res) => {
+    try {
+        const t = (await backupTables()).find(x => x.name === req.params.name);
+        if (!t) return res.status(404).json({ success: false, message: "Unknown table" });
+        const limit = clampInt(req.query.limit, 1, 2000, t.blob ? 3 : 500), offset = clampInt(req.query.offset, 0, 1e9, 0);
+        const orderBy = t.pk.length ? t.pk.map(c => '"' + c + '"').join(",") : "ctid";
+        const rows = (await pool.query('SELECT row_to_json(x) AS r FROM (SELECT * FROM "' + t.name + '" ORDER BY ' + orderBy + " LIMIT $1 OFFSET $2) x", [limit, offset])).rows.map(r => r.r);
+        res.json({ success: true, table: t.name, offset, count: t.count, rows });
+    } catch (e) { console.error("Backup read error:", e); res.status(500).json({ success: false, message: "Could not read table" }); }
+});
+app.post("/api/admin/backup/import", requireAdmin, async (req, res) => {
+    try {
+        const t = (await backupTables()).find(x => x.name === String((req.body || {}).table));
+        const rows = (req.body || {}).rows;
+        if (!t || !Array.isArray(rows)) return res.status(400).json({ success: false, message: "Bad import request" });
+        let inserted = 0, skipped = 0;
+        for (const row of rows) {
+            if (t.name === "users" && req.body.replaceUsers && row && row.username && isUuid(row.id)) {
+                // a fresh account with the same name would block the restore: replace it only if it owns nothing yet
+                await pool.query(`DELETE FROM users u WHERE lower(u.username) = lower($1) AND u.id <> $2
+                    AND NOT EXISTS (SELECT 1 FROM levels l WHERE l.author_id = u.id)`, [row.username, row.id]);
+            }
+            try {
+                const r = await pool.query('INSERT INTO "' + t.name + '" SELECT * FROM json_populate_record(NULL::"' + t.name + '", $1::json) ON CONFLICT DO NOTHING', [JSON.stringify(row)]);
+                if (r.rowCount) inserted++; else skipped++;
+            } catch (e) { skipped++; if (skipped <= 3) console.error("Import row failed in " + t.name + ":", e.message); }
+        }
+        res.json({ success: true, inserted, skipped });
+    } catch (e) { console.error("Backup import error:", e); res.status(500).json({ success: false, message: "Import failed" }); }
+});
+app.post("/api/admin/backup/finish", requireAdmin, async (req, res) => {
+    try {
+        const cols = (await pool.query("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public'")).rows;
+        let fixed = 0;
+        for (const c of cols) {
+            const seq = (await pool.query("SELECT pg_get_serial_sequence($1, $2) AS s", ['"' + c.table_name + '"', c.column_name])).rows[0].s;
+            if (!seq) continue;
+            await pool.query('SELECT setval($1, COALESCE((SELECT MAX("' + c.column_name + '") FROM "' + c.table_name + '"), 0) + 1, false)', [seq]);
+            fixed++;
+        }
+        try { await loadAppSettings(); } catch (e) { /* settings table may be empty */ }
+        res.json({ success: true, sequences: fixed });
+    } catch (e) { console.error("Backup finish error:", e); res.status(500).json({ success: false, message: "Could not finish restore" }); }
 });
 
 async function startServer() {
