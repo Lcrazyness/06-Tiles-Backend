@@ -247,6 +247,11 @@ async function initializeDatabase() {
     await pool.query("CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, read, created_at DESC)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_activity BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("ALTER TABLE vods ADD COLUMN IF NOT EXISTS thumb BYTEA");
+    // creator stats: attempts / clears per level, plus where players die (50 buckets of 2% along the level)
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_stats (level_id UUID PRIMARY KEY REFERENCES levels(id) ON DELETE CASCADE, attempts INTEGER NOT NULL DEFAULT 0, completions INTEGER NOT NULL DEFAULT 0,
+        deaths INTEGER[] NOT NULL DEFAULT array_fill(0, ARRAY[50]), since TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_player_stats (level_id UUID NOT NULL REFERENCES levels(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        attempts INTEGER NOT NULL DEFAULT 0, completed BOOLEAN NOT NULL DEFAULT FALSE, completed_on INTEGER, PRIMARY KEY (level_id, user_id))`);
     await pool.query(`CREATE TABLE IF NOT EXISTS cloud_audio (sha CHAR(64) PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, mime VARCHAR(60) NOT NULL, size INTEGER NOT NULL, data BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
     await pool.query(`INSERT INTO cloud_level_versions (owner_id, owner, local_id, name, data, tile_count, saved_at)
         SELECT c.owner_id, c.owner, c.local_id, c.name, c.data, c.tile_count, c.updated_at FROM cloud_levels c
@@ -454,6 +459,8 @@ function publicLevel(row, full = false) {
         gridOffset: meta.gridOffset || 0,
         strictMode: !!meta.strictMode,
         lockCosmetics: !!meta.lockCosmetics,
+        hideHitboxes: !!meta.hideHitboxes,
+        showLetters: !!meta.showLetters,
         tags: Array.isArray(meta.tags) ? meta.tags : [],
         startPositions: Array.isArray(meta.startPositions) ? meta.startPositions : [],
         hasAudio: !!(row.has_audio || row.audio)
@@ -477,6 +484,7 @@ function sanitizeNotes(data) {
         const hold = !!n.isHold;
         const t = { lane, time: Math.round(time * 1000) / 1000, isHold: hold, holdDuration: hold ? Math.max(0, Math.min(30, Number(n.holdDuration) || 0)) : 0 };
         if (Number.isInteger(n.preset) && n.preset >= 0 && n.preset < 40) t.preset = n.preset;
+        if (!hold && Number.isInteger(n.taps) && n.taps >= 2 && n.taps <= 8) t.taps = n.taps;
         if (Array.isArray(n.groups)) t.groups = [...new Set(n.groups.map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999))].slice(0, 6);
         out.push(t);
     }
@@ -543,6 +551,8 @@ function sanitizeLevel(body) {
     if (Number.isFinite(Number(level.gridOffset))) meta.gridOffset = Math.max(-5, Math.min(5, Number(level.gridOffset)));
     if (level.strictMode) meta.strictMode = true;
     if (level.lockCosmetics) meta.lockCosmetics = true;
+    if (level.hideHitboxes) meta.hideHitboxes = true;
+    if (level.showLetters) meta.showLetters = true;
     if (Array.isArray(level.startPositions)) meta.startPositions = [...new Set(level.startPositions.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n <= 3600).map(n => Math.round(n * 1000) / 1000))].sort((a, b) => a - b).slice(0, 20);
     if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
     if (typeof level.description === "string" && level.description.trim()) meta.description = level.description.trim().slice(0, 400);
@@ -774,6 +784,16 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
                          ON CONFLICT (user_id, level_id) DO UPDATE SET best_pct = GREATEST(level_records.best_pct, EXCLUDED.best_pct),
                             best_score = GREATEST(level_records.best_score, EXCLUDED.best_score), completed = level_records.completed OR EXCLUDED.completed, updated_at = NOW()`,
                         [me, levelId, pct, score, completed]);
+                    try {   // creator stats
+                        const b = Math.min(49, Math.floor(pct / 2));
+                        await pool.query("INSERT INTO level_stats (level_id) VALUES ($1) ON CONFLICT DO NOTHING", [levelId]);
+                        if (completed) await pool.query("UPDATE level_stats SET attempts = attempts + 1, completions = completions + 1 WHERE level_id = $1", [levelId]);
+                        else await pool.query("UPDATE level_stats SET attempts = attempts + 1, deaths[$2] = deaths[$2] + 1 WHERE level_id = $1", [levelId, b + 1]);
+                        await pool.query(`INSERT INTO level_player_stats (level_id, user_id, attempts, completed, completed_on) VALUES ($1,$2,1,$3::boolean, CASE WHEN $3::boolean THEN 1 END)
+                            ON CONFLICT (level_id, user_id) DO UPDATE SET attempts = level_player_stats.attempts + 1,
+                                completed_on = COALESCE(level_player_stats.completed_on, CASE WHEN EXCLUDED.completed THEN level_player_stats.attempts + 1 END),
+                                completed = level_player_stats.completed OR EXCLUDED.completed`, [levelId, me, completed]);
+                    } catch (e) { console.error("level stats", e.message); }
                     try {   // daily / weekly challenge boards + friends' activity
                         const dRow = await getDailyLevelRow(), wRow = await getWeeklyLevelRow();
                         for (const [per, key, row2] of [["d", todayKey(), dRow], ["w", weekStartKey(), wRow]]) {
@@ -1224,7 +1244,7 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
 // a "nerf-only" update: every tile is unchanged from the published version (tiles may only be removed) and the
 // gameplay effects (speed/hitbox/lane flip) are identical. Music and decoration may change freely.
 function isNerfOnly(oldNotes, oldEffects, newNotes, newEffects) {
-    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0].join("|");
+    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0, n.taps > 1 ? n.taps : 1].join("|");
     const gpRandom = x => x && x.type === "random" && Number(x.gp) === 1 && x.mode !== "reset";
     if ((newEffects || []).some(gpRandom)) return false;   // removing a tile renumbers tiles, changing a gameplay randomizer's result
     const have = new Set((oldNotes || []).map(key));
@@ -3160,6 +3180,33 @@ app.post("/api/notifications/read", authenticate, async (req, res) => {
         else await pool.query("UPDATE notifications SET read = TRUE WHERE user_id = $1", [req.auth.userId]);
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false }); }
+});
+
+// creator stats for one level (its author or an admin)
+app.get("/api/levels/:id/stats", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
+        const lv = (await pool.query("SELECT author_id FROM levels WHERE id = $1", [req.params.id])).rows[0];
+        if (!lv) return res.status(404).json({ success: false, message: "Level not found" });
+        if (lv.author_id !== req.auth.userId && !(await checkAdmin(req.auth.userId))) return res.status(403).json({ success: false, message: "Only the creator can see these stats" });
+        const st = (await pool.query("SELECT attempts, completions, deaths, since FROM level_stats WHERE level_id = $1", [req.params.id])).rows[0];
+        const pl = (await pool.query(`SELECT COUNT(*)::int AS players, COUNT(*) FILTER (WHERE completed)::int AS clearers,
+            AVG(completed_on) FILTER (WHERE completed) AS avg_clear FROM level_player_stats WHERE level_id = $1`, [req.params.id])).rows[0];
+        res.json({ success: true, stats: {
+            attempts: st ? st.attempts : 0, completions: st ? st.completions : 0, deaths: st ? st.deaths : new Array(50).fill(0), since: st ? st.since : null,
+            players: pl.players, clearers: pl.clearers, passRate: pl.players ? pl.clearers / pl.players : 0, avgAttemptsToClear: pl.avg_clear === null ? null : Number(pl.avg_clear)
+        } });
+    } catch (e) { console.error("Level stats error:", e); res.status(500).json({ success: false, message: "Could not load stats" }); }
+});
+app.delete("/api/levels/:id/stats", authenticate, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false });
+        const lv = (await pool.query("SELECT author_id FROM levels WHERE id = $1", [req.params.id])).rows[0];
+        if (!lv || (lv.author_id !== req.auth.userId && !(await checkAdmin(req.auth.userId)))) return res.status(403).json({ success: false, message: "Not allowed" });
+        await pool.query("DELETE FROM level_stats WHERE level_id = $1", [req.params.id]);
+        await pool.query("DELETE FROM level_player_stats WHERE level_id = $1", [req.params.id]);
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
 });
 
 // ---------------------------------------------------------------------------
