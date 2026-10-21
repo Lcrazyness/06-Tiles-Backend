@@ -247,6 +247,13 @@ async function initializeDatabase() {
     await pool.query("CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, read, created_at DESC)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_activity BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("ALTER TABLE vods ADD COLUMN IF NOT EXISTS thumb BYTEA");
+    // notes pinned to a moment of a shared level
+    await pool.query(`CREATE TABLE IF NOT EXISTS draft_notes (id BIGSERIAL PRIMARY KEY, draft_id UUID NOT NULL REFERENCES drafts(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        username VARCHAR(20) NOT NULL, at_time REAL NOT NULL DEFAULT 0, body VARCHAR(300) NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE INDEX IF NOT EXISTS draft_notes_idx ON draft_notes (draft_id, at_time)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS level_videos (sha TEXT PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, complete BOOLEAN NOT NULL DEFAULT FALSE,
+        size BIGINT NOT NULL DEFAULT 0, dur REAL NOT NULL DEFAULT 0, w INTEGER NOT NULL DEFAULT 0, h INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("CREATE TABLE IF NOT EXISTS video_chunks (sha TEXT NOT NULL REFERENCES level_videos(sha) ON DELETE CASCADE, idx INTEGER NOT NULL, data BYTEA NOT NULL, PRIMARY KEY (sha, idx))");
     // creator stats: attempts / clears per level, plus where players die (50 buckets of 2% along the level)
     await pool.query(`CREATE TABLE IF NOT EXISTS level_stats (level_id UUID PRIMARY KEY REFERENCES levels(id) ON DELETE CASCADE, attempts INTEGER NOT NULL DEFAULT 0, completions INTEGER NOT NULL DEFAULT 0,
         deaths INTEGER[] NOT NULL DEFAULT array_fill(0, ARRAY[50]), since TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
@@ -518,15 +525,19 @@ function sanitizeDecor(d) {
         }
     }
     const objects = (Array.isArray(d.objects) ? d.objects : []).slice(0, 1500).filter(o => o && typeof o === "object").map(o => ({
-        id: Math.floor(num(o.id, 1, 1e9, 1)), kind: ["square", "triangle", "circle", "glow", "image", "text"].includes(o.kind) ? o.kind : "square",
+        id: Math.floor(num(o.id, 1, 1e9, 1)), kind: ["square", "triangle", "circle", "glow", "image", "text", "video"].includes(o.kind) ? o.kind : "square",
         time: num(o.time, 0, 3600, 0), x: num(o.x, -3000, 3000, 180), y: num(o.y, -3000, 3000, 320),
         w: num(o.w, 1, 4000, 60), h: num(o.h, 1, 4000, 60), rot: num(o.rot, -3600, 3600, 0), alpha: num(o.alpha, 0, 1, 1),
         color: hex(o.color, "#ffffff"), color2: o.color2 ? hex(o.color2, "") : "",
         layer: o.layer === "fg" ? "fg" : "bg", z: Math.floor(num(o.z, -50, 50, 0)), add: !!o.add,
         groups: (Array.isArray(o.groups) ? o.groups : []).map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999).slice(0, 6),
         img: str(o.img, 20), text: str(o.text, 80), font: str(o.font, 40), size: num(o.size, 6, 400, 40), bold: !!o.bold,
-        hidden: !!o.hidden, locked: !!o.locked, name: str(o.name, 30), outline: !!o.outline
-    }));
+        hidden: !!o.hidden, locked: !!o.locked, name: str(o.name, 30), outline: !!o.outline,
+        vid: isSha(o.vid) ? o.vid : "", vw: num(o.vw, 0, 8000, 0), vh: num(o.vh, 0, 8000, 0), vdur: num(o.vdur, 0, 181, 0), vloop: o.vloop !== false, vstart: num(o.vstart, 0, 181, 0), vspeed: num(o.vspeed, 0.25, 4, 1)
+    })).filter(o => o.kind !== "video" || o.vid);
+    // a level may use at most 3 different videos
+    { const seen = new Set(); for (const o of objects) if (o.kind === "video") { if (!seen.has(o.vid) && seen.size >= 3) o.vid = ""; else seen.add(o.vid); } }
+    const objectsOk = objects.filter(o => o.kind !== "video" || o.vid);
     const presets = (Array.isArray(d.presets) ? d.presets : []).slice(0, 40).map(p => {
         p = p && typeof p === "object" ? p : {};
         return { name: str(p.name, 24), style: ["flat", "gradient", "glass", "neon", "outline", "pixel"].includes(p.style) ? p.style : "flat",
@@ -534,7 +545,7 @@ function sanitizeDecor(d) {
             glow: num(p.glow, 0, 60, 0), alpha: num(p.alpha, 0.05, 1, 1), holdColor: p.holdColor ? hex(p.holdColor, "") : "", z: Math.floor(num(p.z, -10, 10, 0)),
             wide: num(p.wide, 0.3, 1, 1), tall: num(p.tall, 0.3, 1.4, 1) };
     });
-    return { objects, images, presets };
+    return { objects: objectsOk, images, presets };
 }
 
 function sanitizeLevel(body) {
@@ -1568,6 +1579,95 @@ app.put("/api/sync/levels/:localId", authenticate, rateLimit("sync", 240, 60 * 6
         res.json({ success: true, needAudio });
     } catch (e) { console.error(e); res.status(500).json({ success: false }); }
 });
+// ---------------------------------------------------------------------------
+// level videos: MP4 files (max 150 MB / 3 minutes) used by "video" decor objects. Stored in 2 MB pieces so no request is ever huge.
+// ---------------------------------------------------------------------------
+const VIDEO_CHUNK = 2 * 1024 * 1024, VIDEO_MAX = 150 * 1024 * 1024, VIDEO_QUOTA = 300 * 1024 * 1024, VIDEO_MAX_SECONDS = 180.5;
+const isSha = s => /^[0-9a-f]{64}$/.test(String(s || ""));
+app.get("/api/videos/:sha/status", authenticate, async (req, res) => {
+    try {
+        if (!isSha(req.params.sha)) return res.status(400).json({ success: false });
+        const r = await pool.query("SELECT complete, size, owner_id FROM level_videos WHERE sha = $1", [req.params.sha]);
+        const v = r.rows[0];
+        const have = v ? Number((await pool.query("SELECT COUNT(*)::int AS n FROM video_chunks WHERE sha = $1", [req.params.sha])).rows[0].n) : 0;
+        res.json({ success: true, exists: !!v, complete: !!(v && v.complete), chunks: have, mine: !!(v && v.owner_id === req.auth.userId) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.put("/api/videos/:sha/:idx", authenticate, rateLimit("videochunk", 400, 60 * 60 * 1000), express.raw({ type: () => true, limit: "3mb" }), async (req, res) => {
+    try {
+        const sha = String(req.params.sha), idx = Number(req.params.idx);
+        if (!isSha(sha) || !Number.isInteger(idx) || idx < 0 || idx > Math.ceil(VIDEO_MAX / VIDEO_CHUNK) || !Buffer.isBuffer(req.body) || !req.body.length || req.body.length > VIDEO_CHUNK) return res.status(400).json({ success: false, message: "Bad video piece" });
+        if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You can't upload right now." });
+        let v = (await pool.query("SELECT owner_id, complete FROM level_videos WHERE sha = $1", [sha])).rows[0];
+        if (v && v.complete) return res.json({ success: true, done: true });
+        if (v && v.owner_id !== req.auth.userId) return res.status(409).json({ success: false, message: "Someone else is uploading this file" });
+        if (!v) {
+            const used = Number((await pool.query("SELECT COALESCE(SUM(size),0) AS n FROM level_videos WHERE owner_id = $1", [req.auth.userId])).rows[0].n);
+            const pending = Number((await pool.query("SELECT COALESCE(SUM(octet_length(c.data)),0) AS n FROM video_chunks c JOIN level_videos v ON v.sha = c.sha WHERE v.owner_id = $1 AND NOT v.complete", [req.auth.userId])).rows[0].n);
+            if (used + pending > VIDEO_QUOTA) return res.status(413).json({ success: false, message: "Video storage limit reached for this account (300 MB)." });
+            await pool.query("INSERT INTO level_videos (sha, owner_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [sha, req.auth.userId]);
+        }
+        await pool.query("INSERT INTO video_chunks (sha, idx, data) VALUES ($1,$2,$3) ON CONFLICT (sha, idx) DO UPDATE SET data = EXCLUDED.data", [sha, idx, req.body]);
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.post("/api/videos/:sha/finish", authenticate, async (req, res) => {
+    const sha = String(req.params.sha);
+    try {
+        if (!isSha(sha)) return res.status(400).json({ success: false });
+        const v = (await pool.query("SELECT owner_id, complete FROM level_videos WHERE sha = $1", [sha])).rows[0];
+        if (!v || v.owner_id !== req.auth.userId) return res.status(404).json({ success: false, message: "Upload not found" });
+        if (v.complete) return res.json({ success: true });
+        const dur = Number((req.body || {}).dur), w = Math.round(Number((req.body || {}).w)) || 0, h = Math.round(Number((req.body || {}).h)) || 0;
+        if (!Number.isFinite(dur) || dur <= 0 || dur > VIDEO_MAX_SECONDS) throw new Error("Videos can be at most 3 minutes long.");
+        const ids = (await pool.query("SELECT idx, octet_length(data) AS n FROM video_chunks WHERE sha = $1 ORDER BY idx", [sha])).rows;
+        const size = ids.reduce((a, r) => a + Number(r.n), 0);
+        if (!ids.length || ids.some((r, i) => r.idx !== i) || ids.slice(0, -1).some(r => Number(r.n) !== VIDEO_CHUNK)) throw new Error("The upload has missing pieces - try again.");
+        if (size > VIDEO_MAX) throw new Error("Videos can be at most 150 MB.");
+        const hash = crypto.createHash("sha256");
+        for (const r of ids) hash.update((await pool.query("SELECT data FROM video_chunks WHERE sha = $1 AND idx = $2", [sha, r.idx])).rows[0].data);
+        if (hash.digest("hex") !== sha) throw new Error("The upload was damaged - try again.");
+        const head = (await pool.query("SELECT substring(data from 5 for 4) AS b FROM video_chunks WHERE sha = $1 AND idx = 0", [sha])).rows[0];
+        if (!head || head.b.toString("latin1") !== "ftyp") throw new Error("That does not look like an MP4 file.");
+        await pool.query("UPDATE level_videos SET complete = TRUE, size = $2, dur = $3, w = $4, h = $5 WHERE sha = $1", [sha, size, dur, w, h]);
+        res.json({ success: true, size });
+    } catch (e) {
+        const known = /^(Videos|The upload|That does)/.test(e.message || "");
+        if (known) { await pool.query("DELETE FROM level_videos WHERE sha = $1 AND NOT complete", [sha]).catch(() => {}); }
+        else console.error(e);
+        res.status(known ? 400 : 500).json({ success: false, message: known ? e.message : "Could not finish the upload" });
+    }
+});
+// public (a <video> tag cannot send a login header); supports Range so the player can seek
+app.get("/api/videos/:sha", async (req, res) => {
+    try {
+        if (!isSha(req.params.sha)) return res.status(400).end();
+        const v = (await pool.query("SELECT size FROM level_videos WHERE sha = $1 AND complete", [req.params.sha])).rows[0];
+        if (!v) return res.status(404).end();
+        const total = Number(v.size);
+        let start = 0, end = total - 1, status = 200;
+        const m = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || ""));
+        if (m && (m[1] || m[2])) {
+            if (m[1] === "") { start = Math.max(0, total - Number(m[2])); }
+            else { start = Number(m[1]); if (m[2]) end = Math.min(total - 1, Number(m[2])); }
+            if (start >= total || start > end) return res.status(416).set("Content-Range", "bytes */" + total).end();
+            end = Math.min(end, start + 8 * 1024 * 1024 - 1);
+            status = 206;
+        }
+        res.status(status).set({ "Content-Type": "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=86400" });
+        if (status === 206) res.set("Content-Range", "bytes " + start + "-" + end + "/" + total);
+        for (let i = Math.floor(start / VIDEO_CHUNK); i <= Math.floor(end / VIDEO_CHUNK); i++) {
+            const from = Math.max(start, i * VIDEO_CHUNK) - i * VIDEO_CHUNK, to = Math.min(end, (i + 1) * VIDEO_CHUNK - 1) - i * VIDEO_CHUNK;
+            const r = (await pool.query("SELECT substring(data from $2 for $3) AS d FROM video_chunks WHERE sha = $1 AND idx = $4", [req.params.sha, from + 1, to - from + 1, i])).rows[0];
+            if (!r) break;
+            if (!res.write(r.d)) await new Promise(ok => res.once("drain", ok));
+            if (res.destroyed) return;
+        }
+        res.end();
+    } catch (e) { console.error(e); if (!res.headersSent) res.status(500).end(); else res.end(); }
+});
+setInterval(() => { pool.query("DELETE FROM level_videos WHERE NOT complete AND created_at < NOW() - INTERVAL '2 hours'").catch(() => {}); }, 30 * 60 * 1000).unref();
+
 app.put("/api/sync/audio/:sha", authenticate, rateLimit("syncaudio", 60, 60 * 60 * 1000), express.raw({ type: () => true, limit: "9mb" }), async (req, res) => {
     try {
         const sha = String(req.params.sha || "");
@@ -2667,6 +2767,7 @@ app.get("/api/streams/config", (req, res) => {
     res.json({ success: true, iceServers, maxViewers: MAX_STREAM_VIEWERS });
 });
 
+const liveRuns = new Map();   // userId -> the run they are playing right now (for friends to spectate)
 io.on("connection", socket => {
     lobby.set(socket.id, socket);
     socket.emit("voice_count", (io.sockets.adapter.rooms.get("voice:global") || { size: 0 }).size);
@@ -2737,6 +2838,74 @@ io.on("connection", socket => {
             io.emit("streams_changed", streamList());
         } catch (e) { console.error("stream_start", e); socket.emit("stream_error", { message: "Could not start the stream." }); }
     });
+    // --- live run spectating (friends only): a runner relays their hits, spectators replay them a moment later ---
+    const liveEnd = () => { const r = liveRuns.get(socket.data.userId); if (r && r.sid === socket.id) { liveRuns.delete(socket.data.userId); io.to("run:" + r.userId).emit("run_end", { userId: r.userId, died: null, end: 0, quit: true }); } };
+    socket.on("run_start", payload => {
+        if (!socket.data.userId || !payload || !isUuid(String(payload.levelId || ""))) return;
+        const r = { sid: socket.id, userId: socket.data.userId, username: socket.data.name, levelId: String(payload.levelId), levelName: String(payload.levelName || "").slice(0, 60),
+            salt: Number.isFinite(Number(payload.salt)) ? Number(payload.salt) >>> 0 : 0, started: Date.now(), t: 0, h: [], w: [], seen: Date.now() };
+        liveRuns.set(r.userId, r);
+        io.to("run:" + r.userId).emit("run_start", { userId: r.userId, levelId: r.levelId, levelName: r.levelName, salt: r.salt });
+    });
+    socket.on("run_batch", payload => {
+        const r = liveRuns.get(socket.data.userId); if (!r || r.sid !== socket.id || !payload) return;
+        const h = (Array.isArray(payload.h) ? payload.h : []).slice(0, 60).filter(e => Array.isArray(e) && e.length === 3).map(e => [Number(e[0]) | 0, Number(e[1]) | 0, clampInt(e[2], 0, 3, 0)]);
+        const w = (Array.isArray(payload.w) ? payload.w : []).slice(0, 30).map(x => Number(x) | 0);
+        const t = Math.max(0, Math.min(3600, Number(payload.t) || 0));
+        if (r.h.length < 8000) r.h.push(...h); if (r.w.length < 2000) r.w.push(...w); r.t = t; r.seen = Date.now();
+        io.to("run:" + r.userId).emit("run_batch", { userId: r.userId, h, w, t });
+    });
+    socket.on("run_end", payload => {
+        const r = liveRuns.get(socket.data.userId); if (!r || r.sid !== socket.id) return;
+        liveRuns.delete(r.userId);
+        io.to("run:" + r.userId).emit("run_end", { userId: r.userId, died: payload && typeof payload.died === "string" ? payload.died.slice(0, 30) : null, end: Math.max(0, Number(payload && payload.end) | 0), completed: !!(payload && payload.completed) });
+    });
+    socket.on("run_list", async () => {
+        try {
+            if (!socket.data.userId) return socket.emit("run_list", { runs: [] });
+            const fr = (await pool.query(`SELECT CASE WHEN user_id = $1 THEN friend_id ELSE user_id END AS fid FROM friendships WHERE status = 'accepted' AND (user_id = $1 OR friend_id = $1)`, [socket.data.userId])).rows.map(x => x.fid);
+            const now = Date.now();
+            socket.emit("run_list", { runs: fr.map(id => liveRuns.get(id)).filter(r => r && now - r.seen < 15000).map(r => ({ userId: r.userId, username: r.username, levelId: r.levelId, levelName: r.levelName, t: r.t })) });
+        } catch (e) { socket.emit("run_list", { runs: [] }); }
+    });
+    socket.on("run_watch", async payload => {
+        try {
+            const uid = payload && String(payload.userId || ""); if (!isUuid(uid) || !socket.data.userId) return;
+            const r = liveRuns.get(uid);
+            if (!r || Date.now() - r.seen > 15000) return socket.emit("run_watching", { error: "They are not in a run right now." });
+            const ok = (await pool.query(`SELECT 1 FROM friendships WHERE status = 'accepted' AND ((user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1))`, [socket.data.userId, uid])).rows.length || await checkAdmin(socket.data.userId);
+            if (!ok) return socket.emit("run_watching", { error: "Only friends can watch your runs." });
+            for (const room of socket.rooms) if (room.startsWith("run:")) socket.leave(room);
+            socket.join("run:" + uid);
+            socket.emit("run_watching", { userId: uid, username: r.username, levelId: r.levelId, levelName: r.levelName, salt: r.salt, t: r.t, h: r.h.slice(-4000), w: r.w.slice(-1000) });
+        } catch (e) { socket.emit("run_watching", { error: "Could not start watching." }); }
+    });
+    socket.on("run_unwatch", () => { for (const room of socket.rooms) if (room.startsWith("run:")) socket.leave(room); });
+    socket.on("disconnect", liveEnd);
+    // --- shared-level editing: live cursors for the people on the same draft ---
+    socket.on("draft_join", async payload => {
+        try {
+            const id = payload && String(payload.id || "");
+            if (!isUuid(id) || !socket.data.userId) return;
+            const d = (await pool.query("SELECT owner_id, verifier_id, collaborators FROM drafts WHERE id = $1", [id])).rows[0];
+            if (!d || !draftRole(d, socket.data.userId)) return;
+            for (const r of socket.rooms) if (r.startsWith("draft:") && r !== "draft:" + id) { socket.leave(r); socket.to(r).emit("draft_peer_leave", { id: socket.id }); }
+            socket.join("draft:" + id);
+            const peers = [];
+            for (const sid of (io.sockets.adapter.rooms.get("draft:" + id) || [])) { if (sid === socket.id) continue; const o = io.sockets.sockets.get(sid); if (o) peers.push({ id: sid, name: o.data.name }); }
+            socket.emit("draft_peers", { draftId: id, peers });
+            socket.to("draft:" + id).emit("draft_peer_join", { id: socket.id, name: socket.data.name });
+        } catch (e) { /* ignore */ }
+    });
+    socket.on("draft_leave", () => { for (const r of socket.rooms) if (r.startsWith("draft:")) { socket.leave(r); socket.to(r).emit("draft_peer_leave", { id: socket.id }); } });
+    socket.on("draft_cursor", payload => {
+        const room = [...socket.rooms].find(r => r.startsWith("draft:")); if (!room || !payload) return;
+        const now = Date.now(); if (socket.data.lastCur && now - socket.data.lastCur < 50) return; socket.data.lastCur = now;
+        const lane = Number(payload.lane), time = Number(payload.time), ph = Number(payload.playhead);
+        socket.to(room).emit("draft_cursor", { id: socket.id, name: socket.data.name, lane: Number.isFinite(lane) ? Math.max(-1, Math.min(3, Math.round(lane))) : -1,
+            time: Number.isFinite(time) ? Math.max(0, Math.min(3600, time)) : 0, playhead: Number.isFinite(ph) ? Math.max(0, Math.min(3600, ph)) : 0 });
+    });
+    socket.on("disconnecting", () => { for (const r of socket.rooms) if (r.startsWith("draft:")) socket.to(r).emit("draft_peer_leave", { id: socket.id }); });
     socket.on("stream_thumb", img => {
         const st = myStream(); if (!st || typeof img !== "string" || !/^data:image\/jpeg;base64,/.test(img) || img.length > 70000) return;
         st.thumb = img;
@@ -3182,6 +3351,51 @@ app.post("/api/notifications/read", authenticate, async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
+// notes pinned to a moment of a shared level (everyone on the level can read/add; the author or the owner can resolve/delete)
+const noteOut = r => ({ id: Number(r.id), user: r.username, userId: r.user_id, time: r.at_time, text: r.body, resolved: r.resolved, at: r.created_at });
+app.get("/api/drafts/:id/notes", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res); if (!d) return;
+        const r = await pool.query("SELECT * FROM draft_notes WHERE draft_id = $1 ORDER BY at_time, id LIMIT 300", [d.id]);
+        res.json({ success: true, notes: r.rows.map(noteOut) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the notes" }); }
+});
+app.post("/api/drafts/:id/notes", authenticate, rateLimit("draftnote", 120, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const d = await loadDraft(req, res); if (!d) return;
+        if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted right now." });
+        const text = String((req.body || {}).text || "").trim().slice(0, 300);
+        if (!text) return res.status(400).json({ success: false, message: "Write something first" });
+        const t = Math.max(0, Math.min(3600, Number((req.body || {}).time) || 0));
+        if (Number((await pool.query("SELECT COUNT(*)::int AS n FROM draft_notes WHERE draft_id = $1", [d.id])).rows[0].n) >= 300) return res.status(400).json({ success: false, message: "Too many notes on this level - resolve some first" });
+        const r = await pool.query("INSERT INTO draft_notes (draft_id, user_id, username, at_time, body) VALUES ($1,$2,$3,$4,$5) RETURNING *", [d.id, req.auth.userId, req.auth.username, t, text]);
+        const note = noteOut(r.rows[0]);
+        io.to("draft:" + d.id).emit("draft_note", { draftId: d.id, note });
+        res.json({ success: true, note });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not add the note" }); }
+});
+app.patch("/api/drafts/:id/notes/:noteId", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res); if (!d) return;
+        const n = (await pool.query("SELECT * FROM draft_notes WHERE id = $1 AND draft_id = $2", [clampInt(req.params.noteId, 1, 9e15, 0), d.id])).rows[0];
+        if (!n) return res.status(404).json({ success: false, message: "Note not found" });
+        const r = await pool.query("UPDATE draft_notes SET resolved = $2 WHERE id = $1 RETURNING *", [n.id, !!(req.body || {}).resolved]);
+        io.to("draft:" + d.id).emit("draft_note_update", { draftId: d.id, note: noteOut(r.rows[0]) });
+        res.json({ success: true, note: noteOut(r.rows[0]) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.delete("/api/drafts/:id/notes/:noteId", authenticate, async (req, res) => {
+    try {
+        const d = await loadDraft(req, res); if (!d) return;
+        const n = (await pool.query("SELECT * FROM draft_notes WHERE id = $1 AND draft_id = $2", [clampInt(req.params.noteId, 1, 9e15, 0), d.id])).rows[0];
+        if (!n) return res.status(404).json({ success: false, message: "Note not found" });
+        if (n.user_id !== req.auth.userId && d.owner_id !== req.auth.userId) return res.status(403).json({ success: false, message: "Only the author of a note or the level owner can delete it" });
+        await pool.query("DELETE FROM draft_notes WHERE id = $1", [n.id]);
+        io.to("draft:" + d.id).emit("draft_note_update", { draftId: d.id, note: { id: Number(n.id), deleted: true } });
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+
 // creator stats for one level (its author or an admin)
 app.get("/api/levels/:id/stats", authenticate, async (req, res) => {
     try {
@@ -3213,8 +3427,9 @@ app.delete("/api/levels/:id/stats", authenticate, async (req, res) => {
 // backup vault (admin only): export every table, paged, and restore it into a new/empty database keeping all ids
 // ---------------------------------------------------------------------------
 const BLOB_TABLES = new Set(["cloud_audio", "vod_blobs", "songs"]);
+const BACKUP_SKIP = new Set(["video_chunks", "level_videos"]);   // 150 MB videos are too big for the device backup
 async function backupTables() {
-    const t = (await pool.query("SELECT tablename FROM pg_tables WHERE schemaname='public'")).rows.map(r => r.tablename);
+    const t = (await pool.query("SELECT tablename FROM pg_tables WHERE schemaname='public'")).rows.map(r => r.tablename).filter(n => !BACKUP_SKIP.has(n));
     const deps = new Map(t.map(n => [n, new Set()]));
     const fk = await pool.query(`SELECT c.conrelid::regclass::text AS child, c.confrelid::regclass::text AS parent FROM pg_constraint c
         JOIN pg_namespace n ON n.oid = c.connamespace WHERE c.contype='f' AND n.nspname='public'`);
