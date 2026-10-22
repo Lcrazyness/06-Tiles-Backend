@@ -253,6 +253,9 @@ async function initializeDatabase() {
     await pool.query("CREATE INDEX IF NOT EXISTS draft_notes_idx ON draft_notes (draft_id, at_time)");
     await pool.query(`CREATE TABLE IF NOT EXISTS level_videos (sha TEXT PRIMARY KEY, owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, complete BOOLEAN NOT NULL DEFAULT FALSE,
         size BIGINT NOT NULL DEFAULT 0, dur REAL NOT NULL DEFAULT 0, w INTEGER NOT NULL DEFAULT 0, h INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("ALTER TABLE level_videos ADD COLUMN IF NOT EXISTS mime TEXT NOT NULL DEFAULT 'video/mp4'");
+    await pool.query("ALTER TABLE level_videos ADD COLUMN IF NOT EXISTS library BOOLEAN NOT NULL DEFAULT FALSE");
+    await pool.query("ALTER TABLE level_videos ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''");
     await pool.query("CREATE TABLE IF NOT EXISTS video_chunks (sha TEXT NOT NULL REFERENCES level_videos(sha) ON DELETE CASCADE, idx INTEGER NOT NULL, data BYTEA NOT NULL, PRIMARY KEY (sha, idx))");
     // creator stats: attempts / clears per level, plus where players die (50 buckets of 2% along the level)
     await pool.query(`CREATE TABLE IF NOT EXISTS level_stats (level_id UUID PRIMARY KEY REFERENCES levels(id) ON DELETE CASCADE, attempts INTEGER NOT NULL DEFAULT 0, completions INTEGER NOT NULL DEFAULT 0,
@@ -492,6 +495,7 @@ function sanitizeNotes(data) {
         const t = { lane, time: Math.round(time * 1000) / 1000, isHold: hold, holdDuration: hold ? Math.max(0, Math.min(30, Number(n.holdDuration) || 0)) : 0 };
         if (Number.isInteger(n.preset) && n.preset >= 0 && n.preset < 40) t.preset = n.preset;
         if (!hold && Number.isInteger(n.taps) && n.taps >= 2 && n.taps <= 8) t.taps = n.taps;
+        if (!hold && (n.fake === 1 || n.fake === 2)) { t.fake = n.fake; const fa = Number(n.fakeAlpha); if (n.fakeAlpha !== "" && n.fakeAlpha !== null && Number.isFinite(fa)) t.fakeAlpha = Math.max(0.05, Math.min(1, Math.round(fa * 100) / 100)); }
         if (Array.isArray(n.groups)) t.groups = [...new Set(n.groups.map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999))].slice(0, 6);
         out.push(t);
     }
@@ -533,10 +537,10 @@ function sanitizeDecor(d) {
         groups: (Array.isArray(o.groups) ? o.groups : []).map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999).slice(0, 6),
         img: str(o.img, 20), text: str(o.text, 80), font: str(o.font, 40), size: num(o.size, 6, 400, 40), bold: !!o.bold,
         hidden: !!o.hidden, locked: !!o.locked, name: str(o.name, 30), outline: !!o.outline,
-        vid: isSha(o.vid) ? o.vid : "", vw: num(o.vw, 0, 8000, 0), vh: num(o.vh, 0, 8000, 0), vdur: num(o.vdur, 0, 181, 0), vloop: o.vloop !== false, vstart: num(o.vstart, 0, 181, 0), vspeed: num(o.vspeed, 0.25, 4, 1)
+        vid: isSha(o.vid) ? o.vid : "", vw: num(o.vw, 0, 8000, 0), vh: num(o.vh, 0, 8000, 0), vdur: num(o.vdur, 0, 100000, 0), vloop: o.vloop !== false, vstart: num(o.vstart, 0, 100000, 0), vspeed: num(o.vspeed, 0.25, 4, 1)
     })).filter(o => o.kind !== "video" || o.vid);
     // a level may use at most 3 different videos
-    { const seen = new Set(); for (const o of objects) if (o.kind === "video") { if (!seen.has(o.vid) && seen.size >= 3) o.vid = ""; else seen.add(o.vid); } }
+    { const seen = new Set(); for (const o of objects) if (o.kind === "video") { if (!seen.has(o.vid) && seen.size >= 6) o.vid = ""; else seen.add(o.vid); } }
     const objectsOk = objects.filter(o => o.kind !== "video" || o.vid);
     const presets = (Array.isArray(d.presets) ? d.presets : []).slice(0, 40).map(p => {
         p = p && typeof p === "object" ? p : {};
@@ -1137,6 +1141,18 @@ app.get("/api/my/levels", authenticate, async (req, res) => {
 });
 
 // Publishing requires an account.
+// the person who verified a level beat it: that counts as a completion (stars / extreme points) and a 100% record on its leaderboard
+async function grantVerification(levelId, userId, score) {
+    try {
+        if (!isUuid(String(levelId)) || !isUuid(String(userId))) return;
+        const l = (await pool.query("SELECT jsonb_array_length(level_data) AS n FROM levels WHERE id = $1", [levelId])).rows[0];
+        if (!l) return;
+        const sc = Math.max(0, Math.min(Number(l.n) * 30 + 1000, Math.floor(Number(score) || Number(l.n) * 10)));
+        await pool.query("INSERT INTO level_completions (user_id, level_id, best_score) VALUES ($1,$2,$3) ON CONFLICT (user_id, level_id) DO NOTHING", [userId, levelId, sc]);
+        await pool.query(`INSERT INTO level_records (user_id, level_id, best_pct, best_score, completed) VALUES ($1,$2,100,$3,TRUE)
+            ON CONFLICT (user_id, level_id) DO UPDATE SET best_pct = 100, completed = TRUE, best_score = GREATEST(level_records.best_score, EXCLUDED.best_score), updated_at = NOW()`, [userId, levelId, sc]);
+    } catch (e) { console.error("grantVerification", e.message); }
+}
 app.post("/api/levels", authenticate, rateLimit("publish", 20, 60 * 60 * 1000), async (req, res) => {
     try {
         if (await isMuted(req.auth.userId)) return res.status(403).json({ success: false, message: "You are muted and can't publish right now." });
@@ -1149,6 +1165,7 @@ app.post("/api/levels", authenticate, rateLimit("publish", 20, 60 * 60 * 1000), 
              clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)]
         );
         await setLevelAudio(result.rows[0].id, clean.audio, clean.decor);
+        await grantVerification(result.rows[0].id, req.auth.userId, req.body && req.body.verifyScore);
         logActivity(req.auth.userId, req.auth.username, "publish", result.rows[0].id, clean.name, {}, "pub:" + result.rows[0].id);
         res.status(201).json({ success: true, level: publicLevel(result.rows[0]) });
     } catch (error) {
@@ -1255,12 +1272,12 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
 // a "nerf-only" update: every tile is unchanged from the published version (tiles may only be removed) and the
 // gameplay effects (speed/hitbox/lane flip) are identical. Music and decoration may change freely.
 function isNerfOnly(oldNotes, oldEffects, newNotes, newEffects) {
-    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0, n.taps > 1 ? n.taps : 1].join("|");
-    const gpRandom = x => x && x.type === "random" && Number(x.gp) === 1 && x.mode !== "reset";
+    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0, n.taps > 1 ? n.taps : 1].concat(n.fake ? [n.fake] : []).join("|");
+    const gpRandom = x => x && x.type === "random" && (Number(x.gp) === 1 || x.mode === "shuffle") && x.mode !== "reset";
     if ((newEffects || []).some(gpRandom)) return false;   // removing a tile renumbers tiles, changing a gameplay randomizer's result
     const have = new Set((oldNotes || []).map(key));
     if (!(newNotes || []).every(n => have.has(key(n)))) return false;
-    const fx = e => JSON.stringify((e || []).filter(x => x && (["speed", "hitbox", "laneflip"].includes(x.type) || (x.type === "random" && Number(x.gp) === 1 && x.mode !== "reset"))));
+    const fx = e => JSON.stringify((e || []).filter(x => x && (["speed", "hitbox", "laneflip", "tilefreeze"].includes(x.type) || (x.type === "random" && (Number(x.gp) === 1 || x.mode === "shuffle") && x.mode !== "reset"))));
     return fx(oldEffects) === fx(newEffects);
 }
 app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000), async (req, res) => {
@@ -1399,6 +1416,7 @@ app.post("/api/drafts/:id/publish", authenticate, async (req, res) => {
             await pool.query("UPDATE drafts SET level_id = $2 WHERE id = $1", [d.id, row.id]);
         }
         await setLevelAudio(row.id, clean.audio, clean.decor);
+        await grantVerification(row.id, d.verifier_id || d.owner_id, 0);
         res.json({ success: true, level: publicLevel(row) });
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not publish" }); }
 });
@@ -1582,7 +1600,7 @@ app.put("/api/sync/levels/:localId", authenticate, rateLimit("sync", 240, 60 * 6
 // ---------------------------------------------------------------------------
 // level videos: MP4 files (max 150 MB / 3 minutes) used by "video" decor objects. Stored in 2 MB pieces so no request is ever huge.
 // ---------------------------------------------------------------------------
-const VIDEO_CHUNK = 2 * 1024 * 1024, VIDEO_MAX = 150 * 1024 * 1024, VIDEO_QUOTA = 300 * 1024 * 1024, VIDEO_MAX_SECONDS = 180.5;
+const VIDEO_CHUNK = 2 * 1024 * 1024, VIDEO_MAX = 300 * 1024 * 1024, VIDEO_QUOTA = 900 * 1024 * 1024;   // admins have no quota; admin "library" videos are free for everyone to use
 const isSha = s => /^[0-9a-f]{64}$/.test(String(s || ""));
 app.get("/api/videos/:sha/status", authenticate, async (req, res) => {
     try {
@@ -1604,7 +1622,7 @@ app.put("/api/videos/:sha/:idx", authenticate, rateLimit("videochunk", 400, 60 *
         if (!v) {
             const used = Number((await pool.query("SELECT COALESCE(SUM(size),0) AS n FROM level_videos WHERE owner_id = $1", [req.auth.userId])).rows[0].n);
             const pending = Number((await pool.query("SELECT COALESCE(SUM(octet_length(c.data)),0) AS n FROM video_chunks c JOIN level_videos v ON v.sha = c.sha WHERE v.owner_id = $1 AND NOT v.complete", [req.auth.userId])).rows[0].n);
-            if (used + pending > VIDEO_QUOTA) return res.status(413).json({ success: false, message: "Video storage limit reached for this account (300 MB)." });
+            if (used + pending > VIDEO_QUOTA && !(await checkAdmin(req.auth.userId))) return res.status(413).json({ success: false, message: "Video storage limit reached for this account (900 MB)." });
             await pool.query("INSERT INTO level_videos (sha, owner_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [sha, req.auth.userId]);
         }
         await pool.query("INSERT INTO video_chunks (sha, idx, data) VALUES ($1,$2,$3) ON CONFLICT (sha, idx) DO UPDATE SET data = EXCLUDED.data", [sha, idx, req.body]);
@@ -1616,33 +1634,50 @@ app.post("/api/videos/:sha/finish", authenticate, async (req, res) => {
     try {
         if (!isSha(sha)) return res.status(400).json({ success: false });
         const v = (await pool.query("SELECT owner_id, complete FROM level_videos WHERE sha = $1", [sha])).rows[0];
-        if (!v || v.owner_id !== req.auth.userId) return res.status(404).json({ success: false, message: "Upload not found" });
+        const isAdm = await checkAdmin(req.auth.userId);
+        if (!v || (v.owner_id !== req.auth.userId && !isAdm)) return res.status(404).json({ success: false, message: "Upload not found" });
         if (v.complete) return res.json({ success: true });
-        const dur = Number((req.body || {}).dur), w = Math.round(Number((req.body || {}).w)) || 0, h = Math.round(Number((req.body || {}).h)) || 0;
-        if (!Number.isFinite(dur) || dur <= 0 || dur > VIDEO_MAX_SECONDS) throw new Error("Videos can be at most 3 minutes long.");
+        const b = req.body || {};
+        const dur = Number(b.dur), w = Math.round(Number(b.w)) || 0, h = Math.round(Number(b.h)) || 0;
+        const mime = /^video\/[a-z0-9.+-]{1,40}$/i.test(String(b.mime || "")) ? String(b.mime).toLowerCase() : "video/mp4";
         const ids = (await pool.query("SELECT idx, octet_length(data) AS n FROM video_chunks WHERE sha = $1 ORDER BY idx", [sha])).rows;
         const size = ids.reduce((a, r) => a + Number(r.n), 0);
         if (!ids.length || ids.some((r, i) => r.idx !== i) || ids.slice(0, -1).some(r => Number(r.n) !== VIDEO_CHUNK)) throw new Error("The upload has missing pieces - try again.");
-        if (size > VIDEO_MAX) throw new Error("Videos can be at most 150 MB.");
+        if (size > VIDEO_MAX) throw new Error("Videos can be at most 300 MB.");
         const hash = crypto.createHash("sha256");
         for (const r of ids) hash.update((await pool.query("SELECT data FROM video_chunks WHERE sha = $1 AND idx = $2", [sha, r.idx])).rows[0].data);
         if (hash.digest("hex") !== sha) throw new Error("The upload was damaged - try again.");
-        const head = (await pool.query("SELECT substring(data from 5 for 4) AS b FROM video_chunks WHERE sha = $1 AND idx = 0", [sha])).rows[0];
-        if (!head || head.b.toString("latin1") !== "ftyp") throw new Error("That does not look like an MP4 file.");
-        await pool.query("UPDATE level_videos SET complete = TRUE, size = $2, dur = $3, w = $4, h = $5 WHERE sha = $1", [sha, size, dur, w, h]);
+        const library = !!(isAdm && b.library);
+        await pool.query("UPDATE level_videos SET complete = TRUE, size = $2, dur = $3, w = $4, h = $5, mime = $6, library = $7, name = $8 WHERE sha = $1",
+            [sha, size, Number.isFinite(dur) && dur > 0 ? dur : 0, w, h, mime, library, String(b.name || "").slice(0, 60)]);
         res.json({ success: true, size });
     } catch (e) {
-        const known = /^(Videos|The upload|That does)/.test(e.message || "");
+        const known = /^(Videos|The upload)/.test(e.message || "");
         if (known) { await pool.query("DELETE FROM level_videos WHERE sha = $1 AND NOT complete", [sha]).catch(() => {}); }
         else console.error(e);
         res.status(known ? 400 : 500).json({ success: false, message: known ? e.message : "Could not finish the upload" });
     }
 });
+// the video library: videos an admin shared, usable in any level without uploading again (no storage cost per level)
+app.get("/api/videos", authenticate, async (req, res) => {
+    try {
+        const r = await pool.query("SELECT sha, name, size, dur, w, h, mime FROM level_videos WHERE complete AND library ORDER BY created_at DESC LIMIT 200");
+        res.json({ success: true, videos: r.rows.map(x => ({ sha: x.sha, name: x.name, size: Number(x.size), dur: x.dur, w: x.w, h: x.h, mime: x.mime })) });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
+app.delete("/api/videos/:sha", requireAdmin, async (req, res) => {
+    try {
+        if (!isSha(req.params.sha)) return res.status(400).json({ success: false });
+        await pool.query("DELETE FROM level_videos WHERE sha = $1", [req.params.sha]);
+        adminLog(req.auth.username, "video_delete", req.params.sha.slice(0, 12), "");
+        res.json({ success: true });
+    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
+});
 // public (a <video> tag cannot send a login header); supports Range so the player can seek
 app.get("/api/videos/:sha", async (req, res) => {
     try {
         if (!isSha(req.params.sha)) return res.status(400).end();
-        const v = (await pool.query("SELECT size FROM level_videos WHERE sha = $1 AND complete", [req.params.sha])).rows[0];
+        const v = (await pool.query("SELECT size, mime FROM level_videos WHERE sha = $1 AND complete", [req.params.sha])).rows[0];
         if (!v) return res.status(404).end();
         const total = Number(v.size);
         let start = 0, end = total - 1, status = 200;
@@ -1654,7 +1689,7 @@ app.get("/api/videos/:sha", async (req, res) => {
             end = Math.min(end, start + 8 * 1024 * 1024 - 1);
             status = 206;
         }
-        res.status(status).set({ "Content-Type": "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=86400" });
+        res.status(status).set({ "Content-Type": v.mime || "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=86400" });
         if (status === 206) res.set("Content-Range", "bytes " + start + "-" + end + "/" + total);
         for (let i = Math.floor(start / VIDEO_CHUNK); i <= Math.floor(end / VIDEO_CHUNK); i++) {
             const from = Math.max(start, i * VIDEO_CHUNK) - i * VIDEO_CHUNK, to = Math.min(end, (i + 1) * VIDEO_CHUNK - 1) - i * VIDEO_CHUNK;
@@ -1740,6 +1775,7 @@ app.post("/api/admin/unpublished/:id/publish", requireAdmin, async (req, res) =>
         let audioUrl = null;
         if (c.audio_sha) { const a = (await pool.query("SELECT mime, data FROM cloud_audio WHERE sha = $1", [c.audio_sha])).rows[0]; if (a) { const url = "data:" + a.mime + ";base64," + a.data.toString("base64"); if (url.length <= 8600000) audioUrl = url; } }
         await setLevelAudio(row.id, audioUrl, clean.decor);
+        await grantVerification(row.id, c.owner_id, 0);
         await pool.query("UPDATE cloud_levels SET published_id = $2 WHERE id = $1", [c.id, row.id]);
         adminLog(req.auth.username, "publish_for", c.owner, c.name);
         res.json({ success: true, level: publicLevel(row) });
@@ -2152,6 +2188,7 @@ app.patch("/api/admin/levels/:id/rate", requireAdmin, async (req, res) => {
         );
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
         if (rated) await pool.query("UPDATE admin_notifications SET read = TRUE WHERE level_id = $1", [req.params.id]);
+        if (rated && result.rows[0].author_id) await grantVerification(req.params.id, result.rows[0].author_id, 0);
         if (rated && result.rows[0].author_id && result.rows[0].author_id !== req.auth.userId) notify(result.rows[0].author_id, "featured", "Your level \"" + result.rows[0].name + "\" was featured and rated " + stars + " star" + (stars === 1 ? "" : "s") + "!", { levelId: req.params.id, dedupe: "feat:" + req.params.id });
         adminLog(req.auth.username, "rate", result.rows[0].name, rated ? stars + " stars, " + (difficulty || result.rows[0].difficulty) : "rating removed");
         res.json({ success: true, level: publicLevel(result.rows[0]) });
