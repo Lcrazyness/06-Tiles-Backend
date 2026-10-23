@@ -181,6 +181,8 @@ async function initializeDatabase() {
     await pool.query("CREATE INDEX IF NOT EXISTS admin_notifications_unread_idx ON admin_notifications (read, created_at DESC)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_stars INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_extreme INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_creator INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 1000");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cosmetics JSONB NOT NULL DEFAULT '{}'::jsonb");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS flags INTEGER NOT NULL DEFAULT 0");
@@ -315,8 +317,8 @@ const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.ga
     u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses,
     u.banned_until, u.ban_reason, u.pending_warning, u.is_admin, u.muted_until,
     (COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0) + u.bonus_stars)::int AS stars, u.elo, u.cosmetics, u.flags,
-    (SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured)::int AS creator_points,
-    COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0)::int AS extreme_points,
+    ((SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured) + u.bonus_creator)::int AS creator_points,
+    (COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0) + u.bonus_extreme)::int AS extreme_points,
     (SELECT COUNT(*) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL)::int AS list_beaten,
     COALESCE((SELECT MAX(${DIFF_RANK_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0)::int AS hardest_rank,
     COALESCE((SELECT jsonb_object_agg(d, n) FROM (SELECT l.difficulty AS d, COUNT(*)::int AS n FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured GROUP BY l.difficulty) x), '{}'::jsonb) AS difficulty_counts`;
@@ -495,6 +497,13 @@ function sanitizeNotes(data) {
         const t = { lane, time: Math.round(time * 1000) / 1000, isHold: hold, holdDuration: hold ? Math.max(0, Math.min(30, Number(n.holdDuration) || 0)) : 0 };
         if (Number.isInteger(n.preset) && n.preset >= 0 && n.preset < 40) t.preset = n.preset;
         if (!hold && Number.isInteger(n.taps) && n.taps >= 2 && n.taps <= 8) t.taps = n.taps;
+        if (hold) {
+            if (n.maxHold) t.maxHold = true;
+            if (n.hstyle === "block") t.hstyle = "block";
+            for (const k of ["barColor", "stemColor", "ringColor", "ringFill"]) if (/^#[0-9a-f]{6}$/i.test(String(n[k] || ""))) t[k] = String(n[k]).toLowerCase();
+            const nm = (k, lo, hi) => { const v = Number(n[k]); if (n[k] !== "" && n[k] !== null && n[k] !== undefined && Number.isFinite(v)) t[k] = Math.max(lo, Math.min(hi, Math.round(v * 100) / 100)); };
+            nm("barAlpha", 0.1, 1); nm("stemW", 2, 24); nm("ringR", 8, 40); nm("barRadius", 0, 45);
+        }
         if (!hold && (n.fake === 1 || n.fake === 2)) { t.fake = n.fake; const fa = Number(n.fakeAlpha); if (n.fakeAlpha !== "" && n.fakeAlpha !== null && Number.isFinite(fa)) t.fakeAlpha = Math.max(0.05, Math.min(1, Math.round(fa * 100) / 100)); }
         if (Array.isArray(n.groups)) t.groups = [...new Set(n.groups.map(Number).filter(g => Number.isInteger(g) && g >= 1 && g <= 99999))].slice(0, 6);
         out.push(t);
@@ -1272,7 +1281,7 @@ app.post("/api/levels/:id/rollback", authenticate, async (req, res) => {
 // a "nerf-only" update: every tile is unchanged from the published version (tiles may only be removed) and the
 // gameplay effects (speed/hitbox/lane flip) are identical. Music and decoration may change freely.
 function isNerfOnly(oldNotes, oldEffects, newNotes, newEffects) {
-    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0, n.taps > 1 ? n.taps : 1].concat(n.fake ? [n.fake] : []).join("|");
+    const key = n => [n.lane, n.time, n.isHold ? 1 : 0, n.isHold ? (n.holdDuration || 0) : 0, n.taps > 1 ? n.taps : 1].concat(n.fake ? [n.fake] : []).concat(n.isHold && n.maxHold ? ["m"] : []).join("|");
     const gpRandom = x => x && x.type === "random" && (Number(x.gp) === 1 || x.mode === "shuffle") && x.mode !== "reset";
     if ((newEffects || []).some(gpRandom)) return false;   // removing a tile renumbers tiles, changing a gameplay randomizer's result
     const have = new Set((oldNotes || []).map(key));
@@ -1854,7 +1863,7 @@ app.post("/api/admin/players/:id/impersonate", requireAdmin, async (req, res) =>
 });
 const STAT_COLUMNS = {
     games_played: "games_played = 0", games_completed: "games_completed = 0", total_score: "total_score = 0", best_score: "best_score = 0",
-    total_notes_hit: "total_notes_hit = 0", battle: "battle_wins = 0, battle_losses = 0", bonus_stars: "bonus_stars = 0", elo: "elo = 1000", flags: "flags = 0"
+    total_notes_hit: "total_notes_hit = 0", battle: "battle_wins = 0, battle_losses = 0", bonus_stars: "bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0", elo: "elo = 1000", flags: "flags = 0"
 };
 app.post("/api/admin/players/:id/remove-stats", requireAdmin, async (req, res) => {
     try {
@@ -2050,6 +2059,27 @@ app.post("/api/admin/players/:id/mute", requireAdmin, async (req, res) => {
         adminLog(req.auth.username, unmute ? "unmute" : "mute", target.username, unmute ? "" : minutes + " min (no comments/publishing)");
         res.json({ success: true });
     } catch (error) { res.status(500).json({ success: false, message: "Could not update the mute" }); }
+});
+// Give (add) or set any stat for a player. Direct stats are written as-is; stars / extreme points / creator points are adjusted with a bonus on top of what they earned.
+const DIRECT_STATS = { games_played: "games_played", games_completed: "games_completed", total_score: "total_score", best_score: "best_score", total_notes_hit: "total_notes_hit", battle_wins: "battle_wins", battle_losses: "battle_losses", elo: "elo" };
+const BONUS_STATS = { stars: ["bonus_stars", "stars"], extreme_points: ["bonus_extreme", "extreme_points"], creator_points: ["bonus_creator", "creator_points"] };
+app.post("/api/admin/players/:id/stat", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const stat = String(req.body.stat || ""), mode = req.body.mode === "set" ? "set" : "add", amount = Math.round(Number(req.body.amount));
+        if (!Number.isFinite(amount) || Math.abs(amount) > 1e9) return res.status(400).json({ success: false, message: "Enter a whole number." });
+        if (DIRECT_STATS[stat]) {
+            const col = DIRECT_STATS[stat];
+            await pool.query("UPDATE users SET " + col + " = LEAST(2000000000, GREATEST(0, " + (mode === "set" ? "$2::bigint" : col + " + $2::bigint") + ")) WHERE id = $1", [target.id, amount]);
+        } else if (BONUS_STATS[stat]) {
+            const [bcol, key] = BONUS_STATS[stat];
+            const cur = Number((await fetchUser(target.id))[key]) || 0, delta = mode === "set" ? amount - cur : amount;
+            await pool.query("UPDATE users SET " + bcol + " = LEAST(1000000000, GREATEST(-1000000000, " + bcol + " + $2::bigint)) WHERE id = $1", [target.id, delta]);
+        } else return res.status(400).json({ success: false, message: "Unknown stat." });
+        modLog(target.id, req.auth.username, "stat", stat + " " + (mode === "set" ? "= " : (amount > 0 ? "+" : "")) + amount);
+        adminLog(req.auth.username, "stat", target.username, stat + " " + (mode === "set" ? "set to " : "changed by ") + amount);
+        res.json({ success: true, player: await fetchUser(target.id) });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not change that stat" }); }
 });
 app.post("/api/admin/players/:id/stars", requireAdmin, async (req, res) => {
     try {
@@ -2359,7 +2389,7 @@ app.post("/api/admin/players/:id/reset-stats", requireAdmin, async (req, res) =>
             `UPDATE users SET games_played = 0, games_completed = 0, total_score = 0, best_score = 0, total_notes_hit = 0,
                 battle_wins = 0, battle_losses = 0, updated_at = NOW() WHERE id = $1`, [target.id]);
         await pool.query("DELETE FROM level_completions WHERE user_id = $1", [target.id]);
-        await pool.query("UPDATE users SET bonus_stars = 0, elo = 1000, flags = 0 WHERE id = $1", [target.id]);
+        await pool.query("UPDATE users SET bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0, elo = 1000, flags = 0 WHERE id = $1", [target.id]);
         await pool.query("DELETE FROM level_records WHERE user_id = $1", [target.id]);
         await pool.query("DELETE FROM daily_claims WHERE user_id = $1", [target.id]);
         modLog(target.id, req.auth.username, "reset", "All statistics removed");
