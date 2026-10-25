@@ -182,6 +182,7 @@ async function initializeDatabase() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_stars INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_extreme INTEGER NOT NULL DEFAULT 0");
+    await pool.query("CREATE TABLE IF NOT EXISTS stat_claims (user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_creator INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 1000");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cosmetics JSONB NOT NULL DEFAULT '{}'::jsonb");
@@ -1683,6 +1684,9 @@ app.delete("/api/videos/:sha", requireAdmin, async (req, res) => {
     } catch (e) { console.error(e); res.status(500).json({ success: false }); }
 });
 // public (a <video> tag cannot send a login header); supports Range so the player can seek
+// free hosting has a monthly bandwidth limit: videos may send at most VIDEO_DAILY_MB per day (set that variable on Render to change it)
+const videoBudget = { day: "", bytes: 0 };
+const VIDEO_DAILY_BYTES = (Number(process.env.VIDEO_DAILY_MB) || 200) * 1024 * 1024;
 app.get("/api/videos/:sha", async (req, res) => {
     try {
         if (!isSha(req.params.sha)) return res.status(400).end();
@@ -1698,7 +1702,11 @@ app.get("/api/videos/:sha", async (req, res) => {
             end = Math.min(end, start + 8 * 1024 * 1024 - 1);
             status = 206;
         }
-        res.status(status).set({ "Content-Type": v.mime || "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=86400" });
+        const today = new Date().toISOString().slice(0, 10);
+        if (videoBudget.day !== today) { videoBudget.day = today; videoBudget.bytes = 0; }
+        if (videoBudget.bytes + (end - start + 1) > VIDEO_DAILY_BYTES) return res.status(503).set("Retry-After", "3600").end();
+        videoBudget.bytes += end - start + 1;
+        res.status(status).set({ "Content-Type": v.mime || "video/mp4", "Accept-Ranges": "bytes", "Content-Length": end - start + 1, "Cache-Control": "public, max-age=31536000, immutable" });
         if (status === 206) res.set("Content-Range", "bytes " + start + "-" + end + "/" + total);
         for (let i = Math.floor(start / VIDEO_CHUNK); i <= Math.floor(end / VIDEO_CHUNK); i++) {
             const from = Math.max(start, i * VIDEO_CHUNK) - i * VIDEO_CHUNK, to = Math.min(end, (i + 1) * VIDEO_CHUNK - 1) - i * VIDEO_CHUNK;
@@ -2063,23 +2071,62 @@ app.post("/api/admin/players/:id/mute", requireAdmin, async (req, res) => {
 // Give (add) or set any stat for a player. Direct stats are written as-is; stars / extreme points / creator points are adjusted with a bonus on top of what they earned.
 const DIRECT_STATS = { games_played: "games_played", games_completed: "games_completed", total_score: "total_score", best_score: "best_score", total_notes_hit: "total_notes_hit", battle_wins: "battle_wins", battle_losses: "battle_losses", elo: "elo" };
 const BONUS_STATS = { stars: ["bonus_stars", "stars"], extreme_points: ["bonus_extreme", "extreme_points"], creator_points: ["bonus_creator", "creator_points"] };
+async function applyStat(userId, stat, mode, amount) {
+    if (DIRECT_STATS[stat]) {
+        const col = DIRECT_STATS[stat];
+        await pool.query("UPDATE users SET " + col + " = LEAST(2000000000, GREATEST(0, " + (mode === "set" ? "$2::bigint" : col + " + $2::bigint") + ")) WHERE id = $1", [userId, amount]);
+    } else if (BONUS_STATS[stat]) {
+        const [bcol, key] = BONUS_STATS[stat];
+        const cur = Number((await fetchUser(userId))[key]) || 0, delta = mode === "set" ? amount - cur : amount;
+        await pool.query("UPDATE users SET " + bcol + " = LEAST(1000000000, GREATEST(-1000000000, " + bcol + " + $2::bigint)) WHERE id = $1", [userId, delta]);
+    } else return false;
+    return true;
+}
 app.post("/api/admin/players/:id/stat", requireAdmin, async (req, res) => {
     try {
         const target = await loadTarget(req, res); if (!target) return;
         const stat = String(req.body.stat || ""), mode = req.body.mode === "set" ? "set" : "add", amount = Math.round(Number(req.body.amount));
         if (!Number.isFinite(amount) || Math.abs(amount) > 1e9) return res.status(400).json({ success: false, message: "Enter a whole number." });
-        if (DIRECT_STATS[stat]) {
-            const col = DIRECT_STATS[stat];
-            await pool.query("UPDATE users SET " + col + " = LEAST(2000000000, GREATEST(0, " + (mode === "set" ? "$2::bigint" : col + " + $2::bigint") + ")) WHERE id = $1", [target.id, amount]);
-        } else if (BONUS_STATS[stat]) {
-            const [bcol, key] = BONUS_STATS[stat];
-            const cur = Number((await fetchUser(target.id))[key]) || 0, delta = mode === "set" ? amount - cur : amount;
-            await pool.query("UPDATE users SET " + bcol + " = LEAST(1000000000, GREATEST(-1000000000, " + bcol + " + $2::bigint)) WHERE id = $1", [target.id, delta]);
-        } else return res.status(400).json({ success: false, message: "Unknown stat." });
+        if (!(await applyStat(target.id, stat, mode, amount))) return res.status(400).json({ success: false, message: "Unknown stat." });
         modLog(target.id, req.auth.username, "stat", stat + " " + (mode === "set" ? "= " : (amount > 0 ? "+" : "")) + amount);
         adminLog(req.auth.username, "stat", target.username, stat + " " + (mode === "set" ? "set to " : "changed by ") + amount);
         res.json({ success: true, player: await fetchUser(target.id) });
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not change that stat" }); }
+});
+// After a server reset a player re-creates their account from their device and sends the stats it remembers; an admin approves (or ignores) them.
+const CLAIM_KEYS = ["stars", "extreme_points", "creator_points", "games_completed", "games_played", "total_score", "best_score", "total_notes_hit", "battle_wins", "battle_losses", "elo"];
+app.post("/api/me/claim-stats", authenticate, rateLimit("claim", 10, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const src = (req.body && req.body.stats) || {}, data = {};
+        for (const k of CLAIM_KEYS) { const v = Math.round(Number(src[k])); if (Number.isFinite(v) && v > 0 && v <= 1e9) data[k] = v; }
+        if (!Object.keys(data).length) return res.json({ success: true, empty: true });
+        const r = await pool.query("INSERT INTO stat_claims (user_id, data) VALUES ($1,$2::jsonb) ON CONFLICT (user_id) DO NOTHING", [req.auth.userId, JSON.stringify(data)]);
+        if (r.rowCount) pool.query(`INSERT INTO admin_notifications (type, user_id, target_user_id, message) VALUES ('stat_claim', $1, $1, $2) ON CONFLICT DO NOTHING`, [req.auth.userId, req.auth.username + " re-created their account and is asking for their old stats back"]).catch(() => {});
+        res.json({ success: true });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not send your stats" }); }
+});
+app.get("/api/admin/players/:id/claim", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const r = await pool.query("SELECT data, created_at FROM stat_claims WHERE user_id = $1", [target.id]);
+        res.json({ success: true, claim: r.rows[0] ? r.rows[0].data : null, at: r.rows[0] ? r.rows[0].created_at : null });
+    } catch (error) { res.status(500).json({ success: false, message: "Could not load it" }); }
+});
+app.post("/api/admin/players/:id/claim/approve", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const r = await pool.query("SELECT data FROM stat_claims WHERE user_id = $1", [target.id]);
+        if (!r.rows[0]) return res.status(404).json({ success: false, message: "No saved stats to approve." });
+        for (const k of CLAIM_KEYS) if (r.rows[0].data[k] !== undefined) await applyStat(target.id, k, "set", Number(r.rows[0].data[k]));
+        await pool.query("DELETE FROM stat_claims WHERE user_id = $1", [target.id]);
+        modLog(target.id, req.auth.username, "stat", "approved device-saved stats");
+        adminLog(req.auth.username, "stat_claim", target.username, "approved");
+        res.json({ success: true });
+    } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not approve" }); }
+});
+app.delete("/api/admin/players/:id/claim", requireAdmin, async (req, res) => {
+    try { const target = await loadTarget(req, res); if (!target) return; await pool.query("DELETE FROM stat_claims WHERE user_id = $1", [target.id]); res.json({ success: true }); }
+    catch (error) { res.status(500).json({ success: false, message: "Could not remove it" }); }
 });
 app.post("/api/admin/players/:id/stars", requireAdmin, async (req, res) => {
     try {
