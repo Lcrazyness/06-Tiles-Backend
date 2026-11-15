@@ -42,7 +42,7 @@ const pool = new Pool({
 });
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: "16mb" }));
+app.use((req, res, next) => req.path === "/api/admin/backup/import" ? next() : express.json({ limit: "16mb" })(req, res, next));   // the restore route has its own, bigger limit
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -3577,7 +3577,7 @@ app.get("/api/admin/backup/table/:name", requireAdmin, async (req, res) => {
         res.json({ success: true, table: t.name, offset, count: t.count, rows });
     } catch (e) { console.error("Backup read error:", e); res.status(500).json({ success: false, message: "Could not read table" }); }
 });
-app.post("/api/admin/backup/import", requireAdmin, async (req, res) => {
+app.post("/api/admin/backup/import", express.json({ limit: "48mb" }), requireAdmin, async (req, res) => {
     try {
         const t = (await backupTables()).find(x => x.name === String((req.body || {}).table));
         const rows = (req.body || {}).rows;
