@@ -249,7 +249,6 @@ async function initializeDatabase() {
         level_id UUID, dedupe VARCHAR(90) NOT NULL, read BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE (user_id, dedupe))`);
     await pool.query("CREATE INDEX IF NOT EXISTS notifications_user_idx ON notifications (user_id, read, created_at DESC)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hide_activity BOOLEAN NOT NULL DEFAULT FALSE");
-    await pool.query("ALTER TABLE vods ADD COLUMN IF NOT EXISTS thumb BYTEA");
     // notes pinned to a moment of a shared level
     await pool.query(`CREATE TABLE IF NOT EXISTS draft_notes (id BIGSERIAL PRIMARY KEY, draft_id UUID NOT NULL REFERENCES drafts(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         username VARCHAR(20) NOT NULL, at_time REAL NOT NULL DEFAULT 0, body VARCHAR(300) NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
@@ -275,6 +274,7 @@ async function initializeDatabase() {
     await pool.query(`CREATE TABLE IF NOT EXISTS vods (id BIGSERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, username VARCHAR(20) NOT NULL, title VARCHAR(60) NOT NULL,
         level_label VARCHAR(60) NOT NULL DEFAULT '', format VARCHAR(8) NOT NULL DEFAULT 'short', duration INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0, mime VARCHAR(40) NOT NULL DEFAULT 'video/webm',
         views INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`);
+    await pool.query("ALTER TABLE vods ADD COLUMN IF NOT EXISTS thumb BYTEA");
     await pool.query("CREATE TABLE IF NOT EXISTS vod_blobs (vod_id BIGINT PRIMARY KEY REFERENCES vods(id) ON DELETE CASCADE, data BYTEA NOT NULL)");
     await pool.query("CREATE TABLE IF NOT EXISTS vod_likes (vod_id BIGINT NOT NULL REFERENCES vods(id) ON DELETE CASCADE, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY (vod_id, user_id))");
     await pool.query("CREATE TABLE IF NOT EXISTS vod_views (vod_id BIGINT NOT NULL REFERENCES vods(id) ON DELETE CASCADE, viewer_key TEXT NOT NULL, PRIMARY KEY (vod_id, viewer_key))");
