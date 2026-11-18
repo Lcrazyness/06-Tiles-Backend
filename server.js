@@ -48,14 +48,20 @@ app.use((req, res, next) => req.path === "/api/admin/backup/import" ? next() : e
 // helpers
 // ---------------------------------------------------------------------------
 const hits = new Map();
-function rateLimit(name, max, windowMs) {
+// count: "all" (default) counts every request; "success" counts only requests that worked (2xx); "failure" counts only the ones that failed.
+// Sign-ups use "success" and logins use "failure", so people sharing one Wi-Fi/school/phone network don't lock each other out.
+function rateLimit(name, max, windowMs, count = "all") {
     return (req, res, next) => {
         const key = name + ":" + (req.ip || "");
         const now = Date.now();
         let entry = hits.get(key);
         if (!entry || entry.reset < now) { entry = { count: 0, reset: now + windowMs }; hits.set(key, entry); }
-        entry.count++;
-        if (entry.count > max) return res.status(429).json({ success: false, message: "Too many requests - slow down a little." });
+        if (entry.count >= max) {
+            const mins = Math.max(1, Math.ceil((entry.reset - now) / 60000));
+            return res.status(429).json({ success: false, message: "Too many requests from this network - try again in about " + mins + " minute" + (mins === 1 ? "" : "s") + "." });
+        }
+        if (count === "all") entry.count++;
+        else res.on("finish", () => { const ok = res.statusCode < 400; if ((count === "success") === ok) entry.count++; });
         next();
     };
 }
@@ -668,7 +674,7 @@ app.get("/api/health", async (req, res) => {
     catch (error) { console.error("Health check error:", error); res.status(503).json({ success: false, database: "disconnected" }); }
 });
 
-app.post("/api/auth/register", rateLimit("register", 10, 60 * 60 * 1000), async (req, res) => {
+app.post("/api/auth/register", rateLimit("register", Number(process.env.REGISTER_PER_HOUR) || 40, 60 * 60 * 1000, "success"), async (req, res) => {
     try {
         if (!appSettings.registrationOpen) return res.status(403).json({ success: false, message: "New registrations are closed right now." });
         const username = String(req.body.username || "").trim();
@@ -695,7 +701,7 @@ app.post("/api/auth/register", rateLimit("register", 10, 60 * 60 * 1000), async 
     }
 });
 
-app.post("/api/auth/login", rateLimit("login", 30, 15 * 60 * 1000), async (req, res) => {
+app.post("/api/auth/login", rateLimit("login", 40, 15 * 60 * 1000, "failure"), async (req, res) => {
     try {
         const usernameOrEmail = String(req.body.usernameOrEmail || "").trim();
         const password = String(req.body.password || "");
