@@ -1460,6 +1460,26 @@ app.get("/api/songs", async (req, res) => {
         res.json({ success: true, songs: r.rows.map(x => ({ id: Number(x.id), name: x.name, artist: x.artist, bpm: x.bpm, size: x.size, addedBy: x.added_by })) });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load songs" }); }
 });
+app.get("/api/levels/:id/audio", async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).end();
+        const r = await pool.query("SELECT audio FROM levels WHERE id = $1", [req.params.id]);
+        const m = r.rows.length && /^data:([a-z0-9\/+.-]+);base64,([\s\S]*)$/i.exec(r.rows[0].audio || "");
+        if (!m) return res.status(404).end();
+        const buf = Buffer.from(m[2], "base64");
+        res.set({ "Content-Type": m[1], "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+        const rng = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
+        if (rng) {
+            const start = rng[1] ? parseInt(rng[1], 10) : 0, end = rng[2] ? Math.min(parseInt(rng[2], 10), buf.length - 1) : buf.length - 1;
+            if (start > end || start >= buf.length) return res.status(416).set("Content-Range", "bytes */" + buf.length).end();
+            res.status(206).set({ "Content-Range": `bytes ${start}-${end}/${buf.length}`, "Content-Length": end - start + 1 });
+            return res.end(buf.subarray(start, end + 1));
+        }
+        res.set("Content-Length", buf.length);
+        res.end(buf);
+    } catch (e) { res.status(500).end(); }
+});
+
 app.get("/api/songs/:id/audio", async (req, res) => {
     try {
         const id = Number(req.params.id);
@@ -2670,7 +2690,12 @@ function levelForMatch(level) {
         data: level.data, effects: level.effects || [], lives: level.lives, fps: level.fps,
         audioOffset: level.audioOffset || 0, disableHolds: !!level.disableHolds, difficulty: level.difficulty || "Normal",
         backgroundColor: level.backgroundColor || "#202738", backgroundBrightness: level.backgroundBrightness || 100,
-        icon: level.icon || null, ratedStars: level.ratedStars || 0
+        icon: level.icon || null, ratedStars: level.ratedStars || 0,
+        // visuals + music: decor/effects ride along once per player; music is NOT sent here, the client streams it from a cacheable endpoint
+        decor: level.decor || null, songId: level.songId || null,
+        audioUrl: level.songId ? null : (level.hasAudio && level.id ? "/api/levels/" + level.id + "/audio" : null),
+        bpm: level.bpm || 120, gridOffset: level.gridOffset || 0, strictMode: !!level.strictMode, lockCosmetics: !!level.lockCosmetics,
+        hideHitboxes: !!level.hideHitboxes, showLetters: !!level.showLetters
     };
 }
 
