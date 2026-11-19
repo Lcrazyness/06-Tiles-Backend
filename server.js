@@ -75,7 +75,7 @@ const isAdminName = name => ADMIN_USERNAMES.includes(String(name || "").trim().t
 async function modLog(userId, adminName, action, detail) { try { await pool.query("INSERT INTO mod_log (user_id, admin_name, action, detail) VALUES ($1,$2,$3,$4)", [userId, adminName, action, String(detail || "").slice(0, 400)]); } catch (e) { console.error("modLog", e); } }
 const isAdminRow = row => !!row && (isAdminName(row.username) || !!row.is_admin);
 const clampInt = (v, lo, hi, d = 0) => { const n = Math.floor(Number(v)); return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : d; };
-const DIFFICULTIES = ["Easy", "Normal", "Hard", "Insane", "Extreme"];
+const DIFFICULTIES = ["Easy", "Normal", "Hard", "Harder", "Insane", "Extreme"];
 
 // Official levels shipped with the server (see ./levels/*.json). Seeded once; admins can delete/edit them afterwards.
 async function seedOfficialLevels() {
@@ -189,8 +189,12 @@ async function initializeDatabase() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_stars INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_extreme INTEGER NOT NULL DEFAULT 0");
     await pool.query("CREATE TABLE IF NOT EXISTS stat_claims (user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, data JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
+    await pool.query("CREATE TABLE IF NOT EXISTS device_codes (id SERIAL PRIMARY KEY, user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, code_hash TEXT NOT NULL UNIQUE, created_by TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ)");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_creator INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 1000");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_rp INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_wins INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_losses INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cosmetics JSONB NOT NULL DEFAULT '{}'::jsonb");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS flags INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE admin_notifications ADD COLUMN IF NOT EXISTS target_user_id UUID REFERENCES users(id) ON DELETE CASCADE");
@@ -298,7 +302,7 @@ async function initializeDatabase() {
         console.log("v3: all player statistics were reset");
     }
     // levels you had already featured before v3 become rated levels worth 1-5 stars by difficulty
-    await pool.query(`UPDATE levels SET rated_stars = CASE difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Hard' THEN 3 WHEN 'Insane' THEN 4 WHEN 'Extreme' THEN 5 ELSE 2 END WHERE featured = TRUE AND rated_stars = 0`);
+    await pool.query(`UPDATE levels SET rated_stars = CASE difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Hard' THEN 3 WHEN 'Harder' THEN 4 WHEN 'Insane' THEN 5 WHEN 'Extreme' THEN 6 ELSE 2 END WHERE featured = TRUE AND rated_stars = 0`);
     await pool.query("CREATE INDEX IF NOT EXISTS levels_rated_idx ON levels (rated_stars) WHERE featured = TRUE");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_created_idx ON levels (created_at DESC)");
     await pool.query("CREATE INDEX IF NOT EXISTS levels_plays_idx ON levels (plays DESC)");
@@ -311,17 +315,21 @@ function createToken(user) {
     return jwt.sign({ userId: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-const DIFF_BY_RANK = [null, "Easy", "Normal", "Hard", "Insane", "Extreme"];
+const DIFF_BY_RANK = [null, "Easy", "Normal", "Hard", "Harder", "Insane", "Extreme"];
+// Player ranks for RANKED battles use the same six names. Ranked points (RP) decide the rank.
+const RANKS = [["Easy", 0], ["Normal", 100], ["Hard", 250], ["Harder", 450], ["Insane", 700], ["Extreme", 1000]];
+const rankIdxOf = rp => { let i = 0; RANKS.forEach(([, t], k) => { if ((Number(rp) || 0) >= t) i = k; }); return i; };
+const rankInfo = rp => { const i = rankIdxOf(rp), next = RANKS[i + 1]; return { name: RANKS[i][0], idx: i, rp: Number(rp) || 0, from: RANKS[i][1], next: next ? next[1] : null }; };
 // The level LIST (admin-ranked, #1 = hardest): beating the level at position p is worth EXTREME POINTS.
 //   #1 = 250 pts, each step down is worth 6% less, never below 5.
 const LIST_POINTS_SQL = "COALESCE(l.list_points, GREATEST(5, CEIL((SELECT COALESCE(MAX(value::numeric), 250) FROM app_meta WHERE key = 'list_max') * POWER(0.94, l.list_position - 1)))::int)";
-const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Hard' THEN 3 WHEN 'Insane' THEN 4 WHEN 'Extreme' THEN 5 ELSE 0 END";
+const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2 WHEN 'Hard' THEN 3 WHEN 'Harder' THEN 4 WHEN 'Insane' THEN 5 WHEN 'Extreme' THEN 6 ELSE 0 END";
 
 // Everything about a player in one SELECT (alias the table as "u").
 // stars / difficulty beaten come from RATED (admin-featured) levels you completed;
 // creator points = how many of YOUR levels are rated.
 const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.games_played, u.games_completed,
-    u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses,
+    u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses, u.rank_rp, u.ranked_wins, u.ranked_losses,
     u.banned_until, u.ban_reason, u.pending_warning, u.is_admin, u.muted_until,
     (COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0) + u.bonus_stars)::int AS stars, u.elo, u.cosmetics, u.flags,
     ((SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured) + u.bonus_creator)::int AS creator_points,
@@ -343,7 +351,7 @@ const levelOfXp = xp => Math.floor(Math.sqrt(xp / 100)) + 1;
 const titleOfLevel = lv => XP_TITLES.filter(t => lv >= t[0]).pop()[1];
 
 const ACHIEVEMENTS = [
-    ["first_clear", u => u.games_completed >= 1], ["rated_clear", u => u.stars >= 1], ["insane", u => u.hardest_rank >= 4], ["extreme", u => u.hardest_rank >= 5],
+    ["first_clear", u => u.games_completed >= 1], ["rated_clear", u => u.stars >= 1], ["insane", u => u.hardest_rank >= 5], ["extreme", u => u.hardest_rank >= 6],
     ["notes_1k", u => Number(u.total_notes_hit) >= 1000], ["notes_10k", u => Number(u.total_notes_hit) >= 10000],
     ["win_1", u => u.battle_wins >= 1], ["win_10", u => u.battle_wins >= 10], ["creator_1", u => u.creator_points >= 1], ["list_1", u => u.list_beaten >= 1],
     ["stars_25", u => u.stars >= 25], ["stars_100", u => u.stars >= 100], ["ep_500", u => u.extreme_points >= 500], ["level_10", u => u.level >= 10], ["elo_1200", u => u.elo >= 1200]
@@ -386,6 +394,7 @@ function publicUser(user, includeEmail = true) {
         difficultyCounts: user.difficulty_counts || {},
         xp, level, title: titleOfLevel(level), xpNext: 100 * level * level,
         elo: user.elo || 1000,
+        rankedRp: user.rank_rp || 0, rank: rankInfo(user.rank_rp), rankedWins: user.ranked_wins || 0, rankedLosses: user.ranked_losses || 0,
         cosmetics: cos.equipped,
         achievements: ACHIEVEMENTS.filter(([, f]) => f(u)).map(([id]) => id),
         statistics: {
@@ -1875,9 +1884,78 @@ app.post("/api/admin/players/:id/impersonate", requireAdmin, async (req, res) =>
         res.json({ success: true, token, user: publicUser(user, true) });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not open that account" }); }
 });
+// ---------------------------------------------------------------------------
+// Admin: create accounts, and "device codes" - a one-time code (or link) that logs ANY device straight into an account
+// with no password. For when normal sign-in is broken. Codes are stored hashed, work once, and expire after 24 hours.
+// ---------------------------------------------------------------------------
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";   // no 0/O/1/I so it is easy to read out
+const randomChars = n => { const b = crypto.randomBytes(n); let o = ""; for (let i = 0; i < n; i++) o += CODE_CHARS[b[i] % CODE_CHARS.length]; return o; };
+const codeHash = c => crypto.createHash("sha256").update(String(c || "").toUpperCase().replace(/[^A-Z0-9]/g, "")).digest("hex");
+async function makeDeviceCode(userId, adminName) {
+    const raw = randomChars(10), code = raw.slice(0, 5) + "-" + raw.slice(5);
+    const r = await pool.query("INSERT INTO device_codes (user_id, code_hash, created_by, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '24 hours') RETURNING expires_at", [userId, codeHash(code), adminName]);
+    return { code, expiresAt: r.rows[0].expires_at };
+}
+app.post("/api/admin/accounts", requireAdmin, rateLimit("adminacct", 60, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const username = String(req.body.username || "").trim();
+        if (!validUsername(username)) return res.status(400).json({ success: false, message: "Username must be 3-20 characters: letters, numbers, underscores" });
+        let email = String(req.body.email || "").trim().toLowerCase();
+        if (email && (!validEmail(email) || email.length > 254)) return res.status(400).json({ success: false, message: "That email doesn't look right (or leave it empty)" });
+        if (!email) email = username.toLowerCase() + "." + randomChars(5).toLowerCase() + "@no-email.invalid";
+        let password = String(req.body.password || ""), generated = false;
+        if (!password) { password = randomChars(12); generated = true; }
+        if (password.length < 8 || password.length > 128) return res.status(400).json({ success: false, message: "Password must be 8-128 characters" });
+        const existing = await pool.query("SELECT username, email FROM users WHERE LOWER(username) = LOWER($1) OR LOWER(email) = LOWER($2) LIMIT 1", [username, email]);
+        if (existing.rows.length) return res.status(409).json({ success: false, message: existing.rows[0].username.toLowerCase() === username.toLowerCase() ? "That username is already taken" : "That email is already registered" });
+        const inserted = await pool.query("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id", [username, email, await bcrypt.hash(password, 12)]);
+        const id = inserted.rows[0].id;
+        adminLog(req.auth.username, "create_account", username, "");
+        const out = { success: true, user: { id, username, email }, password: generated ? password : null };
+        if (req.body.makeCode !== false) Object.assign(out, await makeDeviceCode(id, req.auth.username));
+        res.status(201).json(out);
+    } catch (e) {
+        console.error("admin create account", e);
+        if (e.code === "23505") return res.status(409).json({ success: false, message: "Username or email is already in use" });
+        res.status(500).json({ success: false, message: "Could not create the account" });
+    }
+});
+app.post("/api/admin/players/:id/device-code", requireAdmin, rateLimit("devcodemake", 120, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        if (req.auth.imp) return res.status(400).json({ success: false, message: "Return to your own account first." });
+        if (isAdminRow(target) && !isAdminName(req.auth.username)) return res.status(403).json({ success: false, message: "Only owners can make a device code for another admin." });
+        const out = await makeDeviceCode(target.id, req.auth.username);
+        adminLog(req.auth.username, "device_code", target.username, "");
+        modLog(target.id, req.auth.username, "device_code", "device code created");
+        res.json(Object.assign({ success: true }, out));
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not make a code" }); }
+});
+app.delete("/api/admin/players/:id/device-codes", requireAdmin, async (req, res) => {
+    try {
+        const target = await loadTarget(req, res); if (!target) return;
+        const r = await pool.query("DELETE FROM device_codes WHERE user_id = $1 AND used_at IS NULL", [target.id]);
+        adminLog(req.auth.username, "device_code_revoke", target.username, String(r.rowCount));
+        res.json({ success: true, revoked: r.rowCount });
+    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not revoke codes" }); }
+});
+// public: a device redeems a code and becomes logged in as that account (same reply as a normal login)
+app.post("/api/auth/device-code", rateLimit("devcode", 15, 15 * 60 * 1000, "failure"), async (req, res) => {
+    try {
+        const code = String(req.body.code || "");
+        if (code.replace(/[^A-Za-z0-9]/g, "").length < 8) return res.status(400).json({ success: false, message: "Enter the full device code." });
+        const r = await pool.query("UPDATE device_codes SET used_at = NOW() WHERE code_hash = $1 AND used_at IS NULL AND expires_at > NOW() RETURNING user_id", [codeHash(code)]);
+        if (!r.rows.length) return res.status(401).json({ success: false, message: "That code is not valid, was already used, or has expired. Ask an admin for a new one." });
+        const user = await fetchUser(r.rows[0].user_id);
+        if (!user) return res.status(404).json({ success: false, message: "That account no longer exists." });
+        if (isBanned(user)) return res.status(403).json(banPayload({ until: user.banned_until, reason: user.ban_reason || "" }));
+        modLog(user.id, "system", "device_login", "a device was linked with a code");
+        res.json({ success: true, message: "This device is now logged in as " + user.username, token: createToken(user), user: publicUser(user) });
+    } catch (e) { console.error("device code", e); res.status(500).json({ success: false, message: "Could not use that code" }); }
+});
 const STAT_COLUMNS = {
     games_played: "games_played = 0", games_completed: "games_completed = 0", total_score: "total_score = 0", best_score: "best_score = 0",
-    total_notes_hit: "total_notes_hit = 0", battle: "battle_wins = 0, battle_losses = 0", bonus_stars: "bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0", elo: "elo = 1000", flags: "flags = 0"
+    total_notes_hit: "total_notes_hit = 0", battle: "battle_wins = 0, battle_losses = 0", bonus_stars: "bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0", elo: "elo = 1000", ranked: "rank_rp = 0, ranked_wins = 0, ranked_losses = 0", flags: "flags = 0"
 };
 app.post("/api/admin/players/:id/remove-stats", requireAdmin, async (req, res) => {
     try {
@@ -2075,7 +2153,7 @@ app.post("/api/admin/players/:id/mute", requireAdmin, async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, message: "Could not update the mute" }); }
 });
 // Give (add) or set any stat for a player. Direct stats are written as-is; stars / extreme points / creator points are adjusted with a bonus on top of what they earned.
-const DIRECT_STATS = { games_played: "games_played", games_completed: "games_completed", total_score: "total_score", best_score: "best_score", total_notes_hit: "total_notes_hit", battle_wins: "battle_wins", battle_losses: "battle_losses", elo: "elo" };
+const DIRECT_STATS = { games_played: "games_played", games_completed: "games_completed", total_score: "total_score", best_score: "best_score", total_notes_hit: "total_notes_hit", battle_wins: "battle_wins", battle_losses: "battle_losses", elo: "elo", rank_rp: "rank_rp" };
 const BONUS_STATS = { stars: ["bonus_stars", "stars"], extreme_points: ["bonus_extreme", "extreme_points"], creator_points: ["bonus_creator", "creator_points"] };
 async function applyStat(userId, stat, mode, amount) {
     if (DIRECT_STATS[stat]) {
@@ -2100,7 +2178,7 @@ app.post("/api/admin/players/:id/stat", requireAdmin, async (req, res) => {
     } catch (error) { console.error(error); res.status(500).json({ success: false, message: "Could not change that stat" }); }
 });
 // After a server reset a player re-creates their account from their device and sends the stats it remembers; an admin approves (or ignores) them.
-const CLAIM_KEYS = ["stars", "extreme_points", "creator_points", "games_completed", "games_played", "total_score", "best_score", "total_notes_hit", "battle_wins", "battle_losses", "elo"];
+const CLAIM_KEYS = ["stars", "extreme_points", "creator_points", "games_completed", "games_played", "total_score", "best_score", "total_notes_hit", "battle_wins", "battle_losses", "elo", "rank_rp"];
 app.post("/api/me/claim-stats", authenticate, rateLimit("claim", 10, 60 * 60 * 1000), async (req, res) => {
     try {
         const src = (req.body && req.body.stats) || {}, data = {};
@@ -2440,9 +2518,9 @@ app.post("/api/admin/players/:id/reset-stats", requireAdmin, async (req, res) =>
         const target = await loadTarget(req, res); if (!target) return;
         await pool.query(
             `UPDATE users SET games_played = 0, games_completed = 0, total_score = 0, best_score = 0, total_notes_hit = 0,
-                battle_wins = 0, battle_losses = 0, updated_at = NOW() WHERE id = $1`, [target.id]);
+                battle_wins = 0, battle_losses = 0, rank_rp = 0, ranked_wins = 0, ranked_losses = 0, updated_at = NOW() WHERE id = $1`, [target.id]);
         await pool.query("DELETE FROM level_completions WHERE user_id = $1", [target.id]);
-        await pool.query("UPDATE users SET bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0, elo = 1000, flags = 0 WHERE id = $1", [target.id]);
+        await pool.query("UPDATE users SET bonus_stars = 0, bonus_extreme = 0, bonus_creator = 0, elo = 1000, rank_rp = 0, ranked_wins = 0, ranked_losses = 0, flags = 0 WHERE id = $1", [target.id]);
         await pool.query("DELETE FROM level_records WHERE user_id = $1", [target.id]);
         await pool.query("DELETE FROM daily_claims WHERE user_id = $1", [target.id]);
         modLog(target.id, req.auth.username, "reset", "All statistics removed");
@@ -2493,6 +2571,7 @@ app.get("/api/leaderboards", async (req, res) => {
     try {
         const orderMap = {
             elo: "elo DESC, username ASC",
+            ranked: "rank_rp DESC, ranked_wins DESC, username ASC",
             points: "extreme_points DESC, stars DESC, username ASC",
             stars: "stars DESC, hardest_rank DESC, username ASC",
             difficulty: "hardest_rank DESC, stars DESC, username ASC",
@@ -2757,6 +2836,213 @@ async function tryPairQueue() {
             console.error("Quick match error:", error);
             [a, b].forEach(s => { s.emit("queue_error", { message: "Could not start the match. Try again." }); setStatus(s, "lobby"); });
         }
+    }
+}
+
+// ===========================================================================
+// RANKED + 2v2 (v2 battles)
+//
+// One run each, no rounds: everybody plays the same RATED level with RUN_LIVES hearts. Your score is the % you reach (100% = you
+// finished). Ranked is 1v1: the higher % wins and moves ranked points (RP). 2v2: the team whose two % add up higher wins (no RP).
+// When you die while someone is still alive you spectate them until everyone is done - that only costs a few tiny
+// messages (the other player's taps), never video. Nothing here sends per-frame data.
+// ===========================================================================
+const RUN_LIVES = 5;
+const RM_PROGRESS_MS = 400;
+const rqueue = [];                 // sockets waiting for a ranked match
+const tqueue = [];                 // 2v2 queue entries: { sids: [socketId, ...] }
+const parties = new Map();         // partyId -> { id, members: [socketId, socketId] }
+const partyInvites = new Map();    // inviteId -> { id, from, to, timer }
+const rmatches = new Map();        // matchId -> run match
+
+function partyOf(sid) { for (const p of parties.values()) if (p.members.includes(sid)) return p; return null; }
+function emitParty(p) {
+    const names = p.members.map(id => (lobby.get(id) && lobby.get(id).data.name) || "?");
+    p.members.forEach(id => { const s = lobby.get(id); if (s) s.emit("party_update", { partyId: p.id, members: names, queued: tqueue.some(e => e.sids.includes(id)) }); });
+}
+function leaveParty(sid, quiet) {
+    const p = partyOf(sid); if (!p) return;
+    removeFromTeamQueue(sid);
+    parties.delete(p.id);
+    p.members.forEach(id => { const s = lobby.get(id); if (!s) return; s.emit("party_update", { partyId: null, members: [], queued: false }); if (id !== sid && !quiet) s.emit("party_msg", { message: ((lobby.get(sid) && lobby.get(sid).data.name) || "Your partner") + " left the team." }); });
+}
+function removeFromTeamQueue(sid) {
+    for (let i = tqueue.length - 1; i >= 0; i--) {
+        if (!tqueue[i].sids.includes(sid)) continue;
+        const e = tqueue.splice(i, 1)[0];
+        e.sids.forEach(id => { const s = lobby.get(id); if (s && s.data.status === "queue") setStatus(s, "lobby"); if (s) s.emit("team_queue", { queued: false }); });
+    }
+}
+function removeFromRankedQueue(sid) { const i = rqueue.indexOf(sid); if (i !== -1) rqueue.splice(i, 1); }
+
+// Rated levels whose difficulty sits inside the players' rank range (widened until there are a few to spin). No video levels:
+// videos are the one thing that costs real bandwidth, so they never appear in matches.
+async function wheelLevels(rankIdxs) {
+    let lo = Math.min(...rankIdxs), hi = Math.max(...rankIdxs), rows = [];
+    for (let k = 0; k < 7; k++) {
+        const diffs = DIFFICULTIES.slice(Math.max(0, lo), Math.min(DIFFICULTIES.length - 1, hi) + 1);
+        const r = await pool.query(
+            `SELECT id, name, difficulty FROM levels
+             WHERE featured = TRUE AND difficulty = ANY($1::text[]) AND jsonb_typeof(level_data) = 'array' AND jsonb_array_length(level_data) >= 8
+               AND COALESCE(decor::text, '') !~ '"kind":\\s*"video"'
+             ORDER BY random() LIMIT 8`, [diffs]);
+        rows = r.rows;
+        if (rows.length >= 3 || (lo <= 0 && hi >= DIFFICULTIES.length - 1)) break;
+        lo--; hi++;
+    }
+    return rows;
+}
+const runIdx = (m, sid) => m.order.indexOf(sid);
+const runPlayers = m => m.order.map(sid => m.players[sid]);
+const runEmit = (m, event, payload) => runPlayers(m).forEach(p => { const s = lobby.get(p.sid); if (s) s.emit(event, payload); });
+const cleanBatch = d => ({
+    h: (Array.isArray(d && d.h) ? d.h : []).slice(0, 80).map(x => Array.isArray(x) ? [clampInt(x[0], 0, 36e5), clampInt(x[1], 0, 20000), clampInt(x[2], 0, 3)] : [0, 0, 0]),
+    w: (Array.isArray(d && d.w) ? d.w : []).slice(0, 40).map(x => clampInt(x, 0, 36e5)),
+    t: Math.max(0, Math.min(36000, Number(d && d.t) || 0))
+});
+
+async function startRunMatch(kind, sockets, teamOf) {
+    const players = sockets.map(s => ({ sid: s.id, name: s.data.name, userId: s.data.userId, rp: s.data.rp || 0 }));
+    const rankIdxs = players.map(p => rankIdxOf(p.rp));
+    const rows = await wheelLevels(rankIdxs);
+    if (!rows.length) { sockets.forEach(s => { s.emit("rm_error", { message: "No rated levels exist yet. Ask the admin to rate some levels!" }); setStatus(s, "lobby"); }); return null; }
+    const slices = []; while (slices.length < 8) rows.forEach(r => { if (slices.length < 8) slices.push(r); });
+    const pick = crypto.randomInt(0, slices.length);
+    const full = await pool.query("SELECT * FROM levels WHERE id = $1", [slices[pick].id]);
+    if (!full.rows.length) { sockets.forEach(s => { s.emit("rm_error", { message: "Could not load the level. Try again." }); setStatus(s, "lobby"); }); return null; }
+    const level = Object.assign(levelForMatch(publicLevel(full.rows[0], true)), { lives: RUN_LIVES });
+    const lastNote = (level.data || []).reduce((m, t) => Math.max(m, Number(t.time) || 0), 1);                                   // what the game's % is measured against
+    const endT = (level.data || []).reduce((m, t) => Math.max(m, (Number(t.time) || 0) + (Number(t.holdDuration) || 0)), lastNote);   // when the last hold ends
+    const id = newId("r");
+    const m = { id, kind, level, lastNote, endT, order: sockets.map(s => s.id), players: {}, started: false, done: false, goAt: 0, timers: [] };
+    players.forEach((p, i) => { m.players[p.sid] = Object.assign(p, { team: teamOf ? teamOf[i] : i, ready: false, pct: 0, score: 0, lives: RUN_LIVES, result: null, watching: null, left: false, lastSeen: Date.now(), buf: { h: [], w: [], t: 0 } }); });
+    rmatches.set(id, m);
+    const info = players.map(p => ({ name: p.name, team: m.players[p.sid].team, rank: rankInfo(p.rp).name, rp: kind === "ranked" ? p.rp : undefined }));
+    sockets.forEach((s, i) => {
+        setStatus(s, "match", id);
+        s.emit("rm_found", { matchId: id, kind, you: i, players: info, wheel: { slices: slices.map(x => ({ name: x.name, difficulty: x.difficulty })), pick }, level, lives: RUN_LIVES });
+    });
+    m.timers.push(setTimeout(() => { if (!m.started && !m.done) cancelRun(m, "Someone took too long to load the level."); }, 45000));
+    return m;
+}
+function cancelRun(m, message) {
+    if (m.done) return;
+    m.done = true; m.timers.forEach(clearTimeout); m.timers = [];
+    runPlayers(m).forEach(p => { const s = lobby.get(p.sid); if (s) { s.emit("rm_cancel", { matchId: m.id, message }); setStatus(s, "lobby"); } });
+    rmatches.delete(m.id);
+}
+function beginRun(m) {
+    m.started = true; m.goAt = Date.now();
+    runEmit(m, "rm_go", { matchId: m.id, countdown: 3 });
+    m.timers.push(setTimeout(() => forceFinishAll(m, "TIME"), (m.endT + 30) * 1000));
+    m.timers.push(setInterval(() => {   // somebody went quiet (closed the tab, lost connection): they are out at the % they had
+        const now = Date.now();
+        runPlayers(m).forEach(p => { if (!p.result && now - p.lastSeen > 25000) finishPlayer(m, p, { completed: false, reason: "LEFT", left: true }); });
+    }, 5000));
+}
+function forceFinishAll(m, reason) { runPlayers(m).forEach(p => { if (!p.result) finishPlayer(m, p, { completed: false, reason }); }); }
+
+// what % can a player honestly have after this long? (the level runs in real time, so claiming more than the clock allows is ignored)
+function pctCap(m) { const secs = (Date.now() - m.goAt) / 1000 + 1; return Math.max(0, Math.min(100, Math.floor(secs / Math.max(1, m.lastNote) * 100) + 8)); }
+
+function finishPlayer(m, p, d) {
+    if (m.done || p.result) return;
+    const completed = !!d.completed && (Date.now() - m.goAt) / 1000 >= m.lastNote * 0.9;   // you can't finish a level faster than it plays
+    const pct = completed ? 100 : Math.max(p.pct, Math.min(99, clampInt(d.pct, 0, 99), pctCap(m)));
+    p.pct = pct;
+    p.result = { pct, completed, score: Math.min(clampInt(d.score, 0, 1e9), Math.max(p.score, 0) + 1e6), reason: String(d.reason || "").slice(0, 30), left: !!d.left };
+    if (d.left) p.left = true;
+    runEmit(m, "rm_state", { i: runIdx(m, p.sid), pct, done: true, completed, reason: p.result.reason });
+    if (p.left && m.kind === "ranked") {   // walking out of a ranked match ends it on the spot: the other player wins
+        runPlayers(m).forEach(x => { if (!x.result) x.result = { pct: x.pct, completed: false, score: x.score, reason: "OPPONENT LEFT", left: false }; });
+        return finishRun(m);
+    }
+    // everyone who was watching this player moves on to someone still alive
+    runPlayers(m).forEach(w => { if (w.result && w.watching === p.sid) { w.watching = null; assignWatch(m, w); } });
+    if (runPlayers(m).every(x => x.result)) return finishRun(m);
+    assignWatch(m, p);
+}
+// a finished player watches someone who is still playing (a teammate first)
+function assignWatch(m, w, wantedIdx) {
+    const s = lobby.get(w.sid); if (!s || !w.result || m.done) return;
+    const alive = runPlayers(m).filter(x => !x.result && x.sid !== w.sid);
+    if (!alive.length) { s.emit("rm_spectate", { i: -1 }); return; }
+    const t = (wantedIdx !== undefined && alive.find(x => runIdx(m, x.sid) === wantedIdx)) || alive.find(x => x.team === w.team) || alive[0];
+    w.watching = t.sid;
+    s.emit("rm_spectate", { i: runIdx(m, t.sid), name: t.name, h: t.buf.h, w: t.buf.w, t: t.buf.t });
+}
+
+async function applyRankedResult(m, winner, loser) {
+    try {
+        const r = await pool.query("SELECT id, rank_rp FROM users WHERE id = ANY($1::uuid[])", [[winner.userId, loser.userId]]);
+        const w = r.rows.find(x => x.id === winner.userId), l = r.rows.find(x => x.id === loser.userId);
+        if (!w || !l) return null;
+        const exp = 1 / (1 + Math.pow(10, (l.rank_rp - w.rank_rp) / 400));
+        const delta = Math.max(8, Math.min(38, Math.round(40 * (1 - exp))));
+        const nw = (await pool.query("UPDATE users SET rank_rp = rank_rp + $2, ranked_wins = ranked_wins + 1, battle_wins = battle_wins + 1 WHERE id = $1 RETURNING rank_rp", [w.id, delta])).rows[0].rank_rp;
+        const nl = (await pool.query("UPDATE users SET rank_rp = GREATEST(0, rank_rp - $2), ranked_losses = ranked_losses + 1, battle_losses = battle_losses + 1 WHERE id = $1 RETURNING rank_rp", [l.id, delta])).rows[0].rank_rp;
+        return { [w.id]: { before: w.rank_rp, after: nw }, [l.id]: { before: l.rank_rp, after: nl } };
+    } catch (e) { console.error("ranked result", e); return null; }
+}
+async function finishRun(m) {
+    if (m.done) return;
+    m.done = true; m.timers.forEach(clearTimeout); m.timers.forEach(clearInterval); m.timers = [];
+    const ps = runPlayers(m);
+    const teams = [0, 1].map(t => { const mem = ps.filter(p => p.team === t); return { pct: mem.reduce((a, p) => a + p.result.pct, 0), score: mem.reduce((a, p) => a + p.result.score, 0), n: mem.length }; });
+    // a ranked player who walked out / vanished loses outright, whatever the %
+    const leaver = m.kind === "ranked" ? ps.find(p => p.result.left) : null;
+    let winTeam = null;
+    if (leaver) winTeam = 1 - leaver.team;
+    else if (teams[0].pct !== teams[1].pct) winTeam = teams[0].pct > teams[1].pct ? 0 : 1;
+    else if (teams[0].score !== teams[1].score) winTeam = teams[0].score > teams[1].score ? 0 : 1;
+    let rp = null;
+    if (m.kind === "ranked" && winTeam !== null && ps.every(p => p.userId)) rp = await applyRankedResult(m, ps.find(p => p.team === winTeam), ps.find(p => p.team !== winTeam));
+    else if (m.kind === "team" && winTeam !== null) {
+        const win = ps.filter(p => p.team === winTeam && p.userId).map(p => p.userId), lose = ps.filter(p => p.team !== winTeam && p.userId).map(p => p.userId);
+        try { if (win.length) await pool.query("UPDATE users SET battle_wins = battle_wins + 1 WHERE id = ANY($1::uuid[])", [win]); if (lose.length) await pool.query("UPDATE users SET battle_losses = battle_losses + 1 WHERE id = ANY($1::uuid[])", [lose]); } catch (e) { console.error("team stats", e); }
+    }
+    const list = ps.map(p => ({ name: p.name, team: p.team, pct: p.result.pct, score: p.result.score, completed: p.result.completed, reason: p.result.reason }));
+    ps.forEach((p, i) => {
+        const s = lobby.get(p.sid); if (!s) return;
+        const mine = rp && p.userId && rp[p.userId];
+        s.emit("rm_result", { matchId: m.id, kind: m.kind, you: i, team: p.team, outcome: winTeam === null ? "draw" : winTeam === p.team ? "win" : "lose", forfeit: !!leaver && leaver.team !== p.team, players: list, teams,
+            rp: mine ? { before: mine.before, after: mine.after, delta: mine.after - mine.before, rank: rankInfo(mine.after), oldRank: rankInfo(mine.before) } : null, level: m.level.name });
+        if (mine) s.data.rp = mine.after;
+        setStatus(s, "lobby");
+    });
+    setTimeout(() => rmatches.delete(m.id), 60000).unref();
+}
+
+async function pairRanked() {
+    for (let guard = 0; guard < 20 && rqueue.length >= 2; guard++) {
+        const live = rqueue.map(id => lobby.get(id)).filter(s => s && s.data.status === "queue");
+        rqueue.length = 0; live.forEach(s => rqueue.push(s.id));
+        if (live.length < 2) return;
+        // a random opponent (never yourself on another tab)
+        const a = live[crypto.randomInt(0, live.length)];
+        const others = live.filter(s => s !== a && s.data.userId !== a.data.userId);
+        if (!others.length) return;
+        const b = others[crypto.randomInt(0, others.length)];
+        removeFromRankedQueue(a.id); removeFromRankedQueue(b.id);
+        try { await startRunMatch("ranked", [a, b]); }
+        catch (e) { console.error("ranked pair", e); [a, b].forEach(s => { s.emit("rm_error", { message: "Could not start the match. Try again." }); setStatus(s, "lobby"); }); }
+    }
+}
+// two teams of two: pre-made pairs stay together, single players are paired up with each other
+async function pairTeams() {
+    for (let guard = 0; guard < 10; guard++) {
+        for (let i = tqueue.length - 1; i >= 0; i--) { const e = tqueue[i]; if (!e.sids.every(id => lobby.get(id) && lobby.get(id).data.status === "queue")) tqueue.splice(i, 1); }
+        const duos = tqueue.filter(e => e.sids.length === 2), solos = tqueue.filter(e => e.sids.length === 1);
+        const teams = duos.map(e => e.sids.slice());
+        for (let i = 0; i + 1 < solos.length; i += 2) teams.push([solos[i].sids[0], solos[i + 1].sids[0]]);
+        if (teams.length < 2) return;
+        const [t1, t2] = teams;
+        [...t1, ...t2].forEach(id => removeFromTeamQueue(id));
+        const socks = [...t1, ...t2].map(id => lobby.get(id));
+        if (socks.some(s => !s)) continue;
+        socks.forEach(s => setStatus(s, "queue"));
+        try { await startRunMatch("team", socks, [0, 0, 1, 1]); }
+        catch (e) { console.error("team pair", e); socks.forEach(s => { s.emit("rm_error", { message: "Could not start the match. Try again." }); setStatus(s, "lobby"); }); }
     }
 }
 
@@ -3141,6 +3427,102 @@ io.on("connection", socket => {
         if (socket.data.status === "queue") setStatus(socket, "lobby");
     });
 
+    // --- ranked + 2v2 ---
+    socket.on("ranked_join", async () => {
+        if (!socket.data.userId) return socket.emit("rm_error", { message: "Log in to play ranked." });
+        if (socket.data.status !== "lobby") return;
+        try { socket.data.rp = (await pool.query("SELECT rank_rp FROM users WHERE id = $1", [socket.data.userId])).rows[0].rank_rp; } catch { socket.data.rp = 0; }
+        if (socket.data.status !== "lobby") return;
+        setStatus(socket, "queue"); rqueue.push(socket.id);
+        socket.emit("ranked_queue", { queued: true, rank: rankInfo(socket.data.rp) });
+        pairRanked();
+    });
+    socket.on("ranked_leave", () => { removeFromRankedQueue(socket.id); if (socket.data.status === "queue") setStatus(socket, "lobby"); socket.emit("ranked_queue", { queued: false }); });
+    socket.on("party_invite", payload => {
+        const target = lobby.get(String(payload && payload.toId));
+        if (!target || target.id === socket.id) return socket.emit("party_msg", { message: "That player is no longer online." });
+        if (socket.data.status !== "lobby" || target.data.status !== "lobby") return socket.emit("party_msg", { message: "That player is busy right now." });
+        if (partyOf(socket.id) && partyOf(socket.id).members.length >= 2) return socket.emit("party_msg", { message: "Your team is already full." });
+        if (partyOf(target.id)) return socket.emit("party_msg", { message: target.data.name + " is already in a team." });
+        const id = newId("pi");
+        const inv = { id, from: socket.id, to: target.id, timer: setTimeout(() => { partyInvites.delete(id); }, 30000) };
+        partyInvites.set(id, inv);
+        socket.emit("party_msg", { message: "Team invite sent to " + target.data.name + "." });
+        target.emit("party_invited", { inviteId: id, from: socket.data.name });
+    });
+    socket.on("party_respond", payload => {
+        const inv = partyInvites.get(String(payload && payload.inviteId));
+        if (!inv || inv.to !== socket.id) return;
+        clearTimeout(inv.timer); partyInvites.delete(inv.id);
+        const sender = lobby.get(inv.from);
+        if (!sender) return socket.emit("party_msg", { message: "They left." });
+        if (!payload.accept) return sender.emit("party_msg", { message: socket.data.name + " declined your team invite." });
+        if (partyOf(sender.id) || partyOf(socket.id) || sender.data.status !== "lobby" || socket.data.status !== "lobby") return socket.emit("party_msg", { message: "Could not make the team - someone became busy." });
+        const p = { id: newId("p"), members: [sender.id, socket.id] };
+        parties.set(p.id, p); emitParty(p);
+    });
+    socket.on("party_leave", () => leaveParty(socket.id));
+    socket.on("team_join", async () => {
+        if (socket.data.status !== "lobby") return;
+        const p = partyOf(socket.id);
+        for (const id of (p ? p.members : [socket.id])) {   // their ranked points decide which levels land on the wheel
+            const sk = lobby.get(id);
+            if (sk && sk.data.userId) { try { sk.data.rp = (await pool.query("SELECT rank_rp FROM users WHERE id = $1", [sk.data.userId])).rows[0].rank_rp; } catch { sk.data.rp = 0; } }
+        }
+        if (socket.data.status !== "lobby") return;
+        const sids = p ? p.members.filter(id => lobby.get(id) && lobby.get(id).data.status === "lobby") : [socket.id];
+        if (p && sids.length < 2) return socket.emit("party_msg", { message: "Your partner is busy." });
+        sids.forEach(id => setStatus(lobby.get(id), "queue"));
+        tqueue.push({ sids });
+        sids.forEach(id => lobby.get(id).emit("team_queue", { queued: true, duo: sids.length === 2 }));
+        if (p) emitParty(p);
+        pairTeams();
+    });
+    socket.on("team_leave", () => { const p = partyOf(socket.id); removeFromTeamQueue(socket.id); if (p) emitParty(p); });
+    socket.on("rm_ready", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || m.started || m.done) return;
+        me.ready = true; me.lastSeen = Date.now();
+        if (runPlayers(m).every(p => p.ready)) beginRun(m);
+    });
+    socket.on("rm_progress", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || !m.started || m.done || me.result) return;
+        me.lastSeen = Date.now();
+        me.pct = Math.max(me.pct, Math.min(99, clampInt(payload.pct, 0, 99), pctCap(m)));
+        me.score = clampInt(payload.score, 0, 1e9); me.lives = clampInt(payload.lives, 0, RUN_LIVES);
+        const msg = { i: runIdx(m, socket.id), pct: me.pct, lives: me.lives };
+        runPlayers(m).forEach(p => { if (p.sid !== socket.id) { const s = lobby.get(p.sid); if (s) s.volatile.emit("rm_prog", msg); } });
+    });
+    socket.on("rm_batch", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || !m.started || m.done || me.result) return;
+        me.lastSeen = Date.now();
+        const b = cleanBatch(payload);
+        if (me.buf.h.length < 12000) me.buf.h.push(...b.h);
+        if (me.buf.w.length < 600) me.buf.w.push(...b.w);
+        me.buf.t = b.t;
+        const feed = { i: runIdx(m, socket.id), h: b.h, w: b.w, t: b.t };
+        runPlayers(m).forEach(p => { if (p.result && p.watching === socket.id) { const s = lobby.get(p.sid); if (s) s.emit("rm_feed", feed); } });
+    });
+    socket.on("rm_finish", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || !m.started || m.done || me.result) return;
+        finishPlayer(m, me, { completed: !!payload.completed, pct: payload.pct, score: payload.score, reason: payload.reason });
+    });
+    socket.on("rm_watch", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || m.done || !me.result) return;
+        assignWatch(m, me, clampInt(payload.i, 0, 3, -1));
+    });
+    socket.on("rm_leave", payload => {
+        const m = rmatches.get(String(payload && payload.matchId)), me = m && m.players[socket.id];
+        if (!me || m.done) return;
+        if (!m.started) return cancelRun(m, me.name + " left.");
+        finishPlayer(m, me, { completed: false, reason: "LEFT", left: true });
+        setStatus(socket, "lobby");
+    });
+
     // --- challenges ---
     socket.on("challenge_send", async payload => {
         try {
@@ -3249,6 +3631,14 @@ io.on("connection", socket => {
 
     socket.on("disconnect", () => {
         removeFromQueue(socket.id);
+        removeFromRankedQueue(socket.id);
+        removeFromTeamQueue(socket.id);
+        leaveParty(socket.id);
+        for (const m of rmatches.values()) {
+            const me = m.players[socket.id]; if (!me || m.done) continue;
+            if (!m.started) cancelRun(m, me.name + " disconnected.");
+            else finishPlayer(m, me, { completed: false, reason: "LEFT", left: true });
+        }
         lobby.delete(socket.id);
         for (const [id, c] of challenges) {
             if (c.from === socket.id || c.to === socket.id) {
