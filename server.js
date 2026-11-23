@@ -31,7 +31,7 @@ const bwTotal = () => { bwRoll(); return Object.values(bw.cats).reduce((a, b) =>
 const bwMode = () => { const f = bwTotal() / BW_BUDGET; return f >= 1 ? "paused" : f >= 0.9 ? "tight" : f >= 0.7 ? "saver" : "normal"; };
 const bwCat = p => /\/audio$|^\/api\/songs\//.test(p) ? "music" : /^\/api\/videos\/[0-9a-f]{64}$|^\/api\/vods\/\d+\/video$/.test(p) ? "video" : /\/decor$/.test(p) ? "decor" : /\/thumb$/.test(p) ? "thumbs" : /^\/api\/(sync|admin\/backup)/.test(p) ? "backup" : "api";
 const BW_MSG = { saver: "Videos are switched off for now to save data.", tight: "Music and extras are switched off for now to save data.", paused: "The server is resting to stay inside its monthly data limit. Back on the 1st." };
-const ipHeavy = new Map();   // ip -> { hour, bytes }: nobody gets more than ~150 MB of heavy files per hour
+const ipHeavy = new Map();   // ip -> { hour, bytes }: nobody gets more than ~400 MB of heavy files per hour
 setInterval(() => { const h = Math.floor(Date.now() / 3600000); for (const [k, v] of ipHeavy) if (v.hour !== h) ipHeavy.delete(k); }, 600000).unref();
 app.use((req, res, next) => {
     if (req.method === "OPTIONS") return next();
@@ -40,7 +40,7 @@ app.use((req, res, next) => {
     if (!essential && (mode === "paused" || (mode === "tight" && heavy) || (mode === "saver" && cat === "video"))) return res.status(503).set("Retry-After", "3600").json({ success: false, saver: true, mode, message: BW_MSG[mode] });
     if (heavy) {
         const h = Math.floor(Date.now() / 3600000), e = ipHeavy.get(req.ip);
-        if (e && e.hour === h && e.bytes > 150 * 1048576) return res.status(429).json({ success: false, message: "Slow down - too much music/video from this connection this hour." });
+        if (e && e.hour === h && e.bytes > 400 * 1048576) return res.status(429).json({ success: false, message: "Slow down - too much music/video from this connection this hour (limit about 400 MB per hour). Offline downloads can simply be continued later." });
     }
     let sent = 0; const w = res.write, en = res.end;
     res.write = function (c, ...a) { if (c && typeof c !== "function") sent += Buffer.byteLength(c); return w.call(this, c, ...a); };
