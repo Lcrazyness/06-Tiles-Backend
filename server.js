@@ -17,10 +17,58 @@ const { Server } = require("socket.io");
 
 const app = express();
 app.set("trust proxy", 1);
+// ---------------------------------------------------------------------------
+// bandwidth meter + safety net: counts what the server sends this month (after compression) and sheds the heaviest things first,
+// so the free plan's monthly data limit is never hit by surprise. Set BANDWIDTH_BUDGET_MB on Render to change the budget (default 4500 = 4.5 GB).
+//   70% "saver": video off    90% "tight": music + decor + video off    100% "paused": only login/admin/health work until the 1st
+// ---------------------------------------------------------------------------
+const BW_BUDGET = (Number(process.env.BANDWIDTH_BUDGET_MB) || 4500) * 1048576;
+const bw = { month: "", cats: {}, dirty: false };
+const bwMonth = () => new Date().toISOString().slice(0, 7);
+function bwRoll() { const m = bwMonth(); if (bw.month !== m) { bw.month = m; bw.cats = {}; bw.dirty = true; } }
+function bwAdd(cat, n) { bwRoll(); bw.cats[cat] = (bw.cats[cat] || 0) + n; bw.dirty = true; }
+const bwTotal = () => { bwRoll(); return Object.values(bw.cats).reduce((a, b) => a + b, 0); };
+const bwMode = () => { const f = bwTotal() / BW_BUDGET; return f >= 1 ? "paused" : f >= 0.9 ? "tight" : f >= 0.7 ? "saver" : "normal"; };
+const bwCat = p => /\/audio$|^\/api\/songs\//.test(p) ? "music" : /^\/api\/videos\/[0-9a-f]{64}$|^\/api\/vods\/\d+\/video$/.test(p) ? "video" : /\/decor$/.test(p) ? "decor" : /\/thumb$/.test(p) ? "thumbs" : /^\/api\/(sync|admin\/backup)/.test(p) ? "backup" : "api";
+const BW_MSG = { saver: "Videos are switched off for now to save data.", tight: "Music and extras are switched off for now to save data.", paused: "The server is resting to stay inside its monthly data limit. Back on the 1st." };
+const ipHeavy = new Map();   // ip -> { hour, bytes }: nobody gets more than ~150 MB of heavy files per hour
+setInterval(() => { const h = Math.floor(Date.now() / 3600000); for (const [k, v] of ipHeavy) if (v.hour !== h) ipHeavy.delete(k); }, 600000).unref();
+app.use((req, res, next) => {
+    if (req.method === "OPTIONS") return next();
+    const cat = bwCat(req.path), mode = bwMode(), heavy = cat === "video" || cat === "music" || cat === "decor";
+    const essential = req.path === "/" || req.path === "/api/health" || req.path === "/api/settings" || /^\/api\/(auth|admin)\//.test(req.path);
+    if (!essential && (mode === "paused" || (mode === "tight" && heavy) || (mode === "saver" && cat === "video"))) return res.status(503).set("Retry-After", "3600").json({ success: false, saver: true, mode, message: BW_MSG[mode] });
+    if (heavy) {
+        const h = Math.floor(Date.now() / 3600000), e = ipHeavy.get(req.ip);
+        if (e && e.hour === h && e.bytes > 150 * 1048576) return res.status(429).json({ success: false, message: "Slow down - too much music/video from this connection this hour." });
+    }
+    let sent = 0; const w = res.write, en = res.end;
+    res.write = function (c, ...a) { if (c && typeof c !== "function") sent += Buffer.byteLength(c); return w.call(this, c, ...a); };
+    res.end = function (c, ...a) { if (c && typeof c !== "function") sent += Buffer.byteLength(c); return en.call(this, c, ...a); };
+    res.on("close", () => {
+        bwAdd(cat, sent + 300);
+        if (heavy) { const h = Math.floor(Date.now() / 3600000), e = ipHeavy.get(req.ip); if (e && e.hour === h) e.bytes += sent; else ipHeavy.set(req.ip, { hour: h, bytes: sent }); }
+    });
+    next();
+});
+// GET answers are stored by the browser but re-checked with the server each time (ETag): unchanged levels/lists come back as a tiny 304, never stale
+app.use((req, res, next) => { if (req.method === "GET" && !req.headers.authorization && req.path.startsWith("/api/")) res.set("Cache-Control", "no-cache"); next(); });
+function bwReport() {
+    const total = bwTotal(), mb = n => Math.round(n / 104857.6) / 10;
+    return { month: bw.month, usedMB: mb(total), budgetMB: mb(BW_BUDGET), percent: Math.round(total / BW_BUDGET * 1000) / 10, mode: bwMode(),
+        byType: Object.fromEntries(Object.entries(bw.cats).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, mb(v)])), note: "Counts what this server sent (after compression), restarts lose up to a minute. Render's own dashboard is the final word." };
+}
+async function bwLoad() { try { const r = await pool.query("SELECT value FROM app_meta WHERE key = 'bandwidth'"); if (r.rows.length) { const d = JSON.parse(r.rows[0].value); if (d.month === bwMonth()) { bw.month = d.month; bw.cats = d.cats || {}; } } } catch (e) { console.warn("bandwidth load failed", e.message); } bwRoll(); }
+async function bwSave() { if (!bw.dirty) return; bw.dirty = false; try { await pool.query("INSERT INTO app_meta (key, value) VALUES ('bandwidth', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [JSON.stringify({ month: bw.month, cats: bw.cats })]); } catch (e) { bw.dirty = true; } }
+setInterval(bwSave, 60000).unref();
+process.on("SIGTERM", () => { bwSave().finally(() => process.exit(0)); });
+// gzip JSON/text responses (levels carry big JSON; this cuts outgoing bandwidth a lot). Falls back silently if the package is missing.
+try { app.use(require("compression")({ threshold: 1024 })); } catch (e) { console.warn("compression not installed; run npm install"); }
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: true, credentials: true },
     maxHttpBufferSize: 8e6,
+    perMessageDeflate: { threshold: 1024 },
     pingInterval: 25000,     // school / proxy networks stall for a while: be patient before calling a client dead
     pingTimeout: 60000,
     transports: ["polling", "websocket"],
@@ -477,7 +525,7 @@ function publicLevel(row, full = false) {
         listPosition: row.list_position || null,
         listPoints: row.list_position ? (row.list_points || Math.max(5, Math.ceil(appSettings.listMaxPoints * Math.pow(0.94, row.list_position - 1)))) : 0,
         description: meta.description || "",
-        thumb: meta.thumb || null,
+        thumb: meta.thumb ? (full ? meta.thumb : "/api/levels/" + row.id + "/thumb") : null,
         songId: meta.songId || null,
         createdAt: row.created_at,
         tileCount: row.tile_count !== undefined ? Number(row.tile_count) : (row.level_data || []).length,
@@ -600,7 +648,7 @@ function sanitizeLevel(body) {
     if (Number.isInteger(Number(level.songId)) && Number(level.songId) > 0) meta.songId = Number(level.songId);
     return {
         name, notes, icon, meta, decor: sanitizeDecor(level.decor),
-        audio: typeof level.audio === "string" && /^data:audio\//.test(level.audio) && level.audio.length <= 8600000 ? level.audio : null,
+        audio: typeof level.audio === "string" && /^data:audio\//.test(level.audio) && level.audio.length <= 4300000 ? level.audio : null,
         effects: sanitizeEffects(level.effects),
         lives: clampInt(level.lives, 1, 10, 3),
         fps: clampInt(level.fps, 10, 240, 60),
@@ -679,7 +727,7 @@ function requireAdmin(req, res, next) {
 app.get("/", (req, res) => res.json({ success: true, message: "06-Tiles Backend is running", version: 3, realtime: true }));
 
 app.get("/api/health", async (req, res) => {
-    try { await pool.query("SELECT 1"); res.json({ success: true, database: "connected", online: lobby.size }); }
+    try { await pool.query("SELECT 1"); res.json({ success: true, database: "connected", online: lobby.size, bandwidth: bwReport() }); }
     catch (error) { console.error("Health check error:", error); res.status(503).json({ success: false, database: "disconnected" }); }
 });
 
@@ -1451,35 +1499,6 @@ app.delete("/api/drafts/:id", authenticate, async (req, res) => {
 });
 
 
-// ---------------------------------------------------------------------------
-// song library (admins upload free songs, everyone can pick them in the editor)
-// ---------------------------------------------------------------------------
-app.get("/api/songs", async (req, res) => {
-    try {
-        const r = await pool.query("SELECT id, name, artist, bpm, size, added_by FROM songs ORDER BY name ASC LIMIT 300");
-        res.json({ success: true, songs: r.rows.map(x => ({ id: Number(x.id), name: x.name, artist: x.artist, bpm: x.bpm, size: x.size, addedBy: x.added_by })) });
-    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load songs" }); }
-});
-app.get("/api/levels/:id/audio", async (req, res) => {
-    try {
-        if (!isUuid(req.params.id)) return res.status(404).end();
-        const r = await pool.query("SELECT audio FROM levels WHERE id = $1", [req.params.id]);
-        const m = r.rows.length && /^data:([a-z0-9\/+.-]+);base64,([\s\S]*)$/i.exec(r.rows[0].audio || "");
-        if (!m) return res.status(404).end();
-        const buf = Buffer.from(m[2], "base64");
-        res.set({ "Content-Type": m[1], "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
-        const rng = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
-        if (rng) {
-            const start = rng[1] ? parseInt(rng[1], 10) : 0, end = rng[2] ? Math.min(parseInt(rng[2], 10), buf.length - 1) : buf.length - 1;
-            if (start > end || start >= buf.length) return res.status(416).set("Content-Range", "bytes */" + buf.length).end();
-            res.status(206).set({ "Content-Range": `bytes ${start}-${end}/${buf.length}`, "Content-Length": end - start + 1 });
-            return res.end(buf.subarray(start, end + 1));
-        }
-        res.set("Content-Length", buf.length);
-        res.end(buf);
-    } catch (e) { res.status(500).end(); }
-});
-
 app.get("/api/songs/:id/audio", async (req, res) => {
     try {
         const id = Number(req.params.id);
@@ -1501,23 +1520,6 @@ app.get("/api/songs/:id/audio", async (req, res) => {
         res.end(buf);
     } catch (e) { console.error(e); res.status(500).end(); }
 });
-app.post("/api/admin/songs", requireAdmin, async (req, res) => {
-    try {
-        const name = String(req.body.name || "").trim().slice(0, 80);
-        const data = String(req.body.data || "");
-        if (!name) return res.status(400).json({ success: false, message: "Give the song a name." });
-        if (!/^data:audio\//.test(data) || data.length > 12000000) return res.status(400).json({ success: false, message: "Upload an audio file under about 8 MB." });
-        const bpm = req.body.bpm ? clampInt(req.body.bpm, 30, 1000, null) : null;
-        const r = await pool.query("INSERT INTO songs (name, artist, bpm, size, data, added_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id", [name, String(req.body.artist || "").trim().slice(0, 80), bpm, data.length, data, req.auth.username]);
-        adminLog(req.auth.username, "song_add", name, "");
-        res.status(201).json({ success: true, id: Number(r.rows[0].id) });
-    } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not add the song" }); }
-});
-app.delete("/api/admin/songs/:id", requireAdmin, async (req, res) => {
-    try { await pool.query("DELETE FROM songs WHERE id = $1", [Number(req.params.id) || 0]); adminLog(req.auth.username, "song_del", req.params.id, ""); res.json({ success: true }); }
-    catch (e) { res.status(500).json({ success: false, message: "Could not delete the song" }); }
-});
-
 // ---------------------------------------------------------------------------
 // announcements / update logs (admins post, everyone reads)
 // ---------------------------------------------------------------------------
@@ -1645,7 +1647,7 @@ app.put("/api/sync/levels/:localId", authenticate, rateLimit("sync", 240, 60 * 6
 // ---------------------------------------------------------------------------
 // level videos: MP4 files (max 150 MB / 3 minutes) used by "video" decor objects. Stored in 2 MB pieces so no request is ever huge.
 // ---------------------------------------------------------------------------
-const VIDEO_CHUNK = 2 * 1024 * 1024, VIDEO_MAX = 300 * 1024 * 1024, VIDEO_QUOTA = 900 * 1024 * 1024;   // admins have no quota; admin "library" videos are free for everyone to use
+const VIDEO_CHUNK = 2 * 1024 * 1024, VIDEO_MAX = 40 * 1024 * 1024, VIDEO_QUOTA = 120 * 1024 * 1024;   // admins have no quota; admin "library" videos are free for everyone to use
 const isSha = s => /^[0-9a-f]{64}$/.test(String(s || ""));
 app.get("/api/videos/:sha/status", authenticate, async (req, res) => {
     try {
@@ -1667,7 +1669,7 @@ app.put("/api/videos/:sha/:idx", authenticate, rateLimit("videochunk", 400, 60 *
         if (!v) {
             const used = Number((await pool.query("SELECT COALESCE(SUM(size),0) AS n FROM level_videos WHERE owner_id = $1", [req.auth.userId])).rows[0].n);
             const pending = Number((await pool.query("SELECT COALESCE(SUM(octet_length(c.data)),0) AS n FROM video_chunks c JOIN level_videos v ON v.sha = c.sha WHERE v.owner_id = $1 AND NOT v.complete", [req.auth.userId])).rows[0].n);
-            if (used + pending > VIDEO_QUOTA && !(await checkAdmin(req.auth.userId))) return res.status(413).json({ success: false, message: "Video storage limit reached for this account (900 MB)." });
+            if (used + pending > VIDEO_QUOTA && !(await checkAdmin(req.auth.userId))) return res.status(413).json({ success: false, message: "Video storage limit reached for this account (120 MB)." });
             await pool.query("INSERT INTO level_videos (sha, owner_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [sha, req.auth.userId]);
         }
         await pool.query("INSERT INTO video_chunks (sha, idx, data) VALUES ($1,$2,$3) ON CONFLICT (sha, idx) DO UPDATE SET data = EXCLUDED.data", [sha, idx, req.body]);
@@ -1688,11 +1690,11 @@ app.post("/api/videos/:sha/finish", authenticate, async (req, res) => {
         const ids = (await pool.query("SELECT idx, octet_length(data) AS n FROM video_chunks WHERE sha = $1 ORDER BY idx", [sha])).rows;
         const size = ids.reduce((a, r) => a + Number(r.n), 0);
         if (!ids.length || ids.some((r, i) => r.idx !== i) || ids.slice(0, -1).some(r => Number(r.n) !== VIDEO_CHUNK)) throw new Error("The upload has missing pieces - try again.");
-        if (size > VIDEO_MAX) throw new Error("Videos can be at most 300 MB.");
+        if (size > VIDEO_MAX) throw new Error("Videos can be at most 40 MB.");
         const hash = crypto.createHash("sha256");
         for (const r of ids) hash.update((await pool.query("SELECT data FROM video_chunks WHERE sha = $1 AND idx = $2", [sha, r.idx])).rows[0].data);
         if (hash.digest("hex") !== sha) throw new Error("The upload was damaged - try again.");
-        const library = !!(isAdm && b.library);
+        const library = false;
         await pool.query("UPDATE level_videos SET complete = TRUE, size = $2, dur = $3, w = $4, h = $5, mime = $6, library = $7, name = $8 WHERE sha = $1",
             [sha, size, Number.isFinite(dur) && dur > 0 ? dur : 0, w, h, mime, library, String(b.name || "").slice(0, 60)]);
         res.json({ success: true, size });
@@ -1702,13 +1704,6 @@ app.post("/api/videos/:sha/finish", authenticate, async (req, res) => {
         else console.error(e);
         res.status(known ? 400 : 500).json({ success: false, message: known ? e.message : "Could not finish the upload" });
     }
-});
-// the video library: videos an admin shared, usable in any level without uploading again (no storage cost per level)
-app.get("/api/videos", authenticate, async (req, res) => {
-    try {
-        const r = await pool.query("SELECT sha, name, size, dur, w, h, mime FROM level_videos WHERE complete AND library ORDER BY created_at DESC LIMIT 200");
-        res.json({ success: true, videos: r.rows.map(x => ({ sha: x.sha, name: x.name, size: Number(x.size), dur: x.dur, w: x.w, h: x.h, mime: x.mime })) });
-    } catch (e) { console.error(e); res.status(500).json({ success: false }); }
 });
 app.delete("/api/videos/:sha", requireAdmin, async (req, res) => {
     try {
@@ -1721,7 +1716,7 @@ app.delete("/api/videos/:sha", requireAdmin, async (req, res) => {
 // public (a <video> tag cannot send a login header); supports Range so the player can seek
 // free hosting has a monthly bandwidth limit: videos may send at most VIDEO_DAILY_MB per day (set that variable on Render to change it)
 const videoBudget = { day: "", bytes: 0 };
-const VIDEO_DAILY_BYTES = (Number(process.env.VIDEO_DAILY_MB) || 200) * 1024 * 1024;
+const VIDEO_DAILY_BYTES = (Number(process.env.VIDEO_DAILY_MB) || 100) * 1024 * 1024;
 app.get("/api/videos/:sha", async (req, res) => {
     try {
         if (!isSha(req.params.sha)) return res.status(400).end();
@@ -2008,7 +2003,7 @@ app.get("/api/admin/players/:id/completions", requireAdmin, async (req, res) => 
 });
 
 // --- public settings + username change ---
-app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: appSettings.announcement, dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen, listMaxPoints: appSettings.listMaxPoints }));
+app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: (bwMode() === "normal" ? "" : BW_MSG[bwMode()] + (appSettings.announcement ? " " : "")) + appSettings.announcement, dataMode: bwMode(), dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen, listMaxPoints: appSettings.listMaxPoints }));
 
 app.patch("/api/profile/username", authenticate, async (req, res) => {
     try {
@@ -2692,7 +2687,7 @@ function levelForMatch(level) {
         backgroundColor: level.backgroundColor || "#202738", backgroundBrightness: level.backgroundBrightness || 100,
         icon: level.icon || null, ratedStars: level.ratedStars || 0,
         // visuals + music: decor/effects ride along once per player; music is NOT sent here, the client streams it from a cacheable endpoint
-        decor: level.decor || null, songId: level.songId || null,
+        songId: level.songId || null, hasDecor: !!level.decor,
         audioUrl: level.songId ? null : (level.hasAudio && level.id ? "/api/levels/" + level.id + "/audio" : null),
         bpm: level.bpm || 120, gridOffset: level.gridOffset || 0, strictMode: !!level.strictMode, lockCosmetics: !!level.lockCosmetics,
         hideHitboxes: !!level.hideHitboxes, showLetters: !!level.showLetters
@@ -3130,7 +3125,7 @@ app.get("/api/vods/:id/video", async (req, res) => {
         const m = await pool.query("SELECT size, mime FROM vods WHERE id = $1", [id]);
         if (!m.rows.length) return res.status(404).end();
         const size = m.rows[0].size;
-        res.set({ "Content-Type": m.rows[0].mime, "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=3600", "Access-Control-Allow-Origin": "*" });
+        res.set({ "Content-Type": m.rows[0].mime, "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=86400", "Access-Control-Allow-Origin": "*" });
         const rng = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
         let start = 0, end = size - 1;
         if (rng) {
@@ -3199,6 +3194,7 @@ app.get("/api/streams/config", (req, res) => {
 });
 
 const liveRuns = new Map();   // userId -> the run they are playing right now (for friends to spectate)
+io.engine.on("connection", raw => raw.on("packetCreate", p => { if (p && p.data) bwAdd("live", (typeof p.data === "string" ? Buffer.byteLength(p.data) : (p.data.length || p.data.byteLength || 0)) + 8); }));
 io.on("connection", socket => {
     lobby.set(socket.id, socket);
     socket.emit("voice_count", (io.sockets.adapter.rooms.get("voice:global") || { size: 0 }).size);
@@ -4036,6 +4032,7 @@ app.post("/api/admin/backup/finish", requireAdmin, async (req, res) => {
 async function startServer() {
     try {
         await initializeDatabase();
+        await bwLoad();
         await seedOfficialLevels();
         server.listen(PORT, () => {
             console.log(`06-Tiles Backend v3 running on port ${PORT}`);
