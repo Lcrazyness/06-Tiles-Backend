@@ -1191,12 +1191,33 @@ app.get("/api/levels", async (req, res) => {
     }
 });
 
+// Offline mode: a paged index (small rows + size estimates) so the game can work out what is new and how big a download would be.
+app.get("/api/offline/index", rateLimit("offidx", 120, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const after = isUuid(req.query.after) ? String(req.query.after) : null;
+        const ratedOnly = String(req.query.scope || "rated") !== "all";
+        const r = await pool.query(
+            `SELECT l.id, l.name, l.author, l.difficulty, l.featured, l.rated_stars, l.meta,
+                    CASE WHEN jsonb_typeof(l.level_data) = 'array' THEN jsonb_array_length(l.level_data) ELSE 0 END AS tile_count,
+                    (l.audio IS NOT NULL) AS has_audio,
+                    COALESCE(octet_length(l.audio) * 3 / 4, 0) + COALESCE((SELECT s.size FROM songs s WHERE l.meta->>'songId' ~ '^[0-9]+$' AND s.id = (l.meta->>'songId')::bigint), 0) AS audio_bytes,
+                    octet_length(l.level_data::text) + octet_length(l.effects::text) + COALESCE(octet_length(l.decor::text), 0) AS data_bytes,
+                    COALESCE((SELECT SUM(v.size) FROM level_videos v WHERE v.complete AND l.decor IS NOT NULL
+                              AND v.sha IN (SELECT jsonb_array_elements_text(jsonb_path_query_array(l.decor, '$.objects[*] ? (@.kind == "video").vid')))), 0) AS video_bytes,
+                    (extract(epoch FROM l.updated_at) * 1000)::bigint AS ver
+             FROM levels l WHERE ($1::uuid IS NULL OR l.id > $1::uuid) AND ($2::boolean = FALSE OR l.featured) ORDER BY l.id LIMIT 200`, [after, ratedOnly]);
+        res.json({ success: true, levels: r.rows.map(x => ({ id: x.id, name: x.name, author: x.author, difficulty: x.difficulty, stars: x.featured ? (x.rated_stars || 0) : 0, tiles: Number(x.tile_count), songId: (x.meta && x.meta.songId) || null, hasAudio: !!x.has_audio, audioBytes: Number(x.audio_bytes), dataBytes: Number(x.data_bytes), videoBytes: Number(x.video_bytes), ver: Number(x.ver) })), next: r.rows.length === 200 ? r.rows[199].id : null });
+    } catch (e) { console.error("offline index error:", e); res.status(500).json({ success: false, message: "Could not build the offline list" }); }
+});
+
 app.get("/api/levels/:id", async (req, res) => {
     try {
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const result = await pool.query("SELECT * FROM levels WHERE id = $1", [req.params.id]);
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found" });
-        res.json(publicLevel(result.rows[0], true));
+        const full = publicLevel(result.rows[0], true);
+        if (req.query.lite) full.audio = null;   // callers that fetch the music separately (as a cacheable file) skip the 33%-bigger inline copy
+        res.json(full);
     } catch (error) {
         console.error("Level fetch error:", error);
         res.status(500).json({ success: false, message: "Could not load level" });
