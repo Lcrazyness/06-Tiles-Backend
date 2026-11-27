@@ -1447,7 +1447,7 @@ app.delete("/api/levels/:id", authenticate, async (req, res) => {
 
 // Keep the last 10 versions of a level so the author can roll back.
 async function snapshotLevel(levelId, authorId) {
-    const r = await pool.query("SELECT name, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta FROM levels WHERE id = $1 AND author_id = $2", [levelId, authorId]);
+    const r = await pool.query("SELECT name, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta FROM levels WHERE id = $1 AND author_id IS NOT DISTINCT FROM $2", [levelId, authorId]);
     if (!r.rows.length) return;
     await pool.query("INSERT INTO level_versions (level_id, snapshot) VALUES ($1, $2::jsonb)", [levelId, JSON.stringify(r.rows[0])]);
     await pool.query("DELETE FROM level_versions WHERE level_id = $1 AND id NOT IN (SELECT id FROM level_versions WHERE level_id = $1 ORDER BY saved_at DESC LIMIT 10)", [levelId]);
@@ -1492,24 +1492,33 @@ app.put("/api/levels/:id", authenticate, rateLimit("publish", 40, 60 * 60 * 1000
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const clean = sanitizeLevel(req.body);
         if (clean.error) return res.status(400).json({ success: false, message: clean.error });
+        // Owners edit their own levels; admins can edit ANY published level (official/Thanksgiving ones included) and it updates for everyone.
+        const prevRow = (await pool.query("SELECT author_id, name, meta FROM levels WHERE id = $1", [req.params.id])).rows[0];
+        if (!prevRow) return res.status(404).json({ success: false, message: "Level not found" });
+        const byAdmin = prevRow.author_id !== req.auth.userId;
+        if (byAdmin && !(await checkAdmin(req.auth.userId))) return res.status(404).json({ success: false, message: "Level not found or you do not own it" });
+        const keepTags = ((prevRow.meta || {}).tags || []).filter(t => t === "thanksgiving");   // the feast tag can't be typed in by creators, but it must survive an edit
+        if (keepTags.length) clean.meta.tags = [...new Set([...(clean.meta.tags || []), ...keepTags])];
+        if (byAdmin) clean.meta.thumb = clean.meta.thumb || ((prevRow.meta || {}).thumb) || undefined;
         if (req.body && req.body.nerfOnly) {
             const prev = (await pool.query("SELECT level_data, effects FROM levels WHERE id=$1 AND author_id=$2", [req.params.id, req.auth.userId])).rows[0];
             if (prev && !isNerfOnly(prev.level_data, prev.effects, clean.notes, clean.effects)) {
                 return res.status(400).json({ success: false, message: "That update changes more than removing tiles or music, so it has to be beaten again." });
             }
         }
-        await snapshotLevel(req.params.id, req.auth.userId);
+        await snapshotLevel(req.params.id, prevRow.author_id);
         const result = await pool.query(
             `UPDATE levels SET name=$3, icon=$4, level_data=$5::jsonb, effects=$6::jsonb, lives=$7, fps=$8, audio_offset=$9,
                 disable_holds=$10, difficulty=$11, meta=$12::jsonb, updated_at=NOW()
-             WHERE id=$1 AND author_id=$2 RETURNING *`,
-            [req.params.id, req.auth.userId, clean.name, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects),
+             WHERE id=$1 AND author_id IS NOT DISTINCT FROM $2 RETURNING *`,
+            [req.params.id, prevRow.author_id, clean.name, clean.icon, JSON.stringify(clean.notes), JSON.stringify(clean.effects),
              clean.lives, clean.fps, clean.audioOffset, clean.disableHolds, clean.difficulty, JSON.stringify(clean.meta)]
         );
         if (!result.rows.length) return res.status(404).json({ success: false, message: "Level not found or you do not own it" });
         const row = result.rows[0];
         await setLevelAudio(row.id, clean.audio, clean.decor);
-        if (row.featured || row.list_position) {
+        if (byAdmin) adminLog(req.auth.username, "level-content-edit", row.name, "edited in the editor");
+        if (!byAdmin && (row.featured || row.list_position)) {
             await pool.query(
                 `INSERT INTO admin_notifications (type, level_id, user_id, message) VALUES ('level_updated', $1, $2, $3)
                  ON CONFLICT (type, level_id, user_id) DO UPDATE SET read = FALSE, created_at = NOW(), message = EXCLUDED.message`,
