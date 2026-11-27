@@ -150,6 +150,79 @@ async function seedOfficialLevels() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The six Thanksgiving levels (Easy -> Extreme) are generated here, so there are no level files to upload. They are added to the database once
+// (see seedThanksgivingLevels), tagged "thanksgiving" and rated. Same seed = same level every time.
+// ---------------------------------------------------------------------------
+function tgBuild(spec) {
+    let st = spec.seed >>> 0;
+    const rnd = () => { st = (st + 0x6D2B79F5) >>> 0; let t = st; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const beat = 60 / spec.bpm, step = beat * spec.step, notes = [];
+    const busyUntil = [0, 0, 0, 0];      // a held lane is not used again until the hold ends
+    let last = -1, run = 0, t = 2.0;
+    const pickLane = (avoid, allowJack) => {
+        const opts = [0, 1, 2, 3].filter(l => !avoid.includes(l) && busyUntil[l] <= t - 0.02);
+        if (!opts.length) return -1;
+        let pool = opts.filter(l => l !== last || (allowJack && run < spec.maxJack));
+        if (!pool.length) pool = opts;
+        // prefer lanes close to the last one (keeps it playable), sometimes jump
+        if (last >= 0 && rnd() > spec.jump) { const near = pool.filter(l => Math.abs(l - last) <= 1); if (near.length) pool = near; }
+        return pool[Math.floor(rnd() * pool.length)];
+    };
+    while (t < spec.length) {
+        const bp = (t - 2.0) / beat, phrase = Math.floor(bp / 8), inPhrase = bp - phrase * 8;   // 8-beat phrases: a rest at the end, busier in the middle
+        const burst = !!spec.burst && phrase % 5 === 4 && inPhrase < 4;                           // every 5th phrase starts with a double-speed burst
+        const rest = inPhrase >= 7 || (phrase % 4 === 3 && inPhrase >= 5.5);
+        let d = spec.density * (0.8 + 0.2 * Math.sin(phrase * 1.3));
+        if (burst) d = Math.min(1, d + 0.15);
+        if (!rest && rnd() < d) {
+            const lane = pickLane([], burst);
+            if (lane >= 0) {
+                const n = { time: t, lane, isHold: false, holdDuration: 0 };
+                if (!burst && rnd() < spec.hold && inPhrase < 6) { n.isHold = true; n.holdDuration = Math.round(beat * (1 + Math.floor(rnd() * 2)) * 1000) / 1000; busyUntil[lane] = t + n.holdDuration + 0.05; }
+                notes.push(n); run = lane === last ? run + 1 : 0; last = lane;
+                if (!n.isHold && !burst && rnd() < spec.chord) {
+                    const l2 = pickLane([lane], false);
+                    if (l2 >= 0) {
+                        notes.push({ time: t, lane: l2, isHold: false, holdDuration: 0 });
+                        if (spec.triple && rnd() < spec.triple) { const l3 = pickLane([lane, l2], false); if (l3 >= 0) notes.push({ time: t, lane: l3, isHold: false, holdDuration: 0 }); }
+                    }
+                }
+            }
+        }
+        t += burst ? step / 2 : step;
+    }
+    return notes.map(n => ({ time: Math.round(n.time * 1000) / 1000, lane: n.lane, isHold: n.isHold, holdDuration: n.holdDuration }));
+}
+function buildThanksgivingLevels() {
+    const L = [
+        { name: "Turkey Trot", difficulty: "Easy", stars: 1, bpm: 72, step: 1, length: 52, density: 0.85, chord: 0, hold: 0.06, jump: 0.15, maxJack: 1, lives: 5, seed: 1101, bg: "#7a4a1e", desc: "A gentle jog around the farm. One tile at a time." },
+        { name: "Pumpkin Patch", difficulty: "Normal", stars: 2, bpm: 100, step: 0.5, length: 62, density: 0.58, chord: 0, hold: 0.07, jump: 0.2, maxJack: 1, lives: 4, seed: 1202, bg: "#8a4a12", desc: "Weave between the pumpkins. Steady taps and a few holds." },
+        { name: "Cranberry Rush", difficulty: "Hard", stars: 3, bpm: 126, step: 0.5, length: 70, density: 0.66, chord: 0.07, hold: 0.07, jump: 0.3, maxJack: 2, lives: 3, seed: 1303, bg: "#7a1f2e", desc: "Tart, fast and a little sneaky. Watch for the double tiles." },
+        { name: "Gravy Train", difficulty: "Harder", stars: 4, bpm: 144, step: 0.5, length: 78, density: 0.74, chord: 0.13, hold: 0.07, jump: 0.35, maxJack: 2, lives: 3, seed: 1404, bg: "#6b3d14", desc: "All aboard! Streams, doubles and no brakes." },
+        { name: "Harvest Moon", difficulty: "Insane", stars: 5, bpm: 164, step: 0.5, length: 86, density: 0.82, chord: 0.2, hold: 0.07, jump: 0.4, maxJack: 3, burst: true, lives: 3, seed: 1505, bg: "#3b1f4a", desc: "The field glows under the moon. Bursts of jacks and chords." },
+        { name: "Feast Mode", difficulty: "Extreme", stars: 6, bpm: 188, step: 0.5, length: 96, density: 0.9, chord: 0.27, triple: 0.08, hold: 0.06, jump: 0.45, maxJack: 4, burst: true, lives: 3, seed: 1606, bg: "#4a0d0d", desc: "Seconds on everything. Beat this one and the whole table is yours." }
+    ];
+    return L.map(x => ({ name: x.name, author: "06 Tiles", difficulty: x.difficulty, ratedStars: x.stars, lives: x.lives, bpm: x.bpm, backgroundColor: x.bg, description: "🦃 Thanksgiving event - " + x.desc, data: tgBuild(x) }));
+}
+async function seedThanksgivingLevels() {
+    for (const raw of buildThanksgivingLevels()) {
+        const key = "seeded:tg2026:" + raw.name;
+        try {
+            if ((await pool.query("SELECT 1 FROM app_meta WHERE key = $1", [key])).rows.length) continue;
+            const clean = sanitizeLevel(raw);
+            if (clean.error) { console.error("Thanksgiving level " + raw.name + " invalid: " + clean.error); continue; }
+            clean.meta.tags = ["thanksgiving"];
+            await pool.query(
+                `INSERT INTO levels (name, author_id, author, icon, level_data, effects, lives, fps, audio_offset, disable_holds, difficulty, meta, featured, rated_stars)
+                 VALUES ($1,NULL,$2,NULL,$3::jsonb,'[]'::jsonb,$4,$5,0,FALSE,$6,$7::jsonb,TRUE,$8)`,
+                [clean.name, raw.author, JSON.stringify(clean.notes), clean.lives, clean.fps, clean.difficulty, JSON.stringify(clean.meta), raw.ratedStars]);
+            await pool.query("INSERT INTO app_meta (key, value) VALUES ($1, NOW()::text) ON CONFLICT DO NOTHING", [key]);
+            console.log("Seeded Thanksgiving level: " + clean.name);
+        } catch (error) { console.error("Seeding Thanksgiving level " + raw.name + " failed:", error); }
+    }
+}
+
 async function initializeDatabase() {
     await pool.query("CREATE EXTENSION IF NOT EXISTS pgcrypto");
     await pool.query(`
@@ -241,6 +314,8 @@ async function initializeDatabase() {
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bonus_creator INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 1000");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_rp INTEGER NOT NULL DEFAULT 0");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS event_badges TEXT[] NOT NULL DEFAULT '{}'");
+    await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS event_days TEXT[] NOT NULL DEFAULT '{}'");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_wins INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS ranked_losses INTEGER NOT NULL DEFAULT 0");
     await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS cosmetics JSONB NOT NULL DEFAULT '{}'::jsonb");
@@ -398,6 +473,31 @@ const xpOf = u => Number(u.total_notes_hit || 0) + (u.games_completed || 0) * 50
 const levelOfXp = xp => Math.floor(Math.sqrt(xp / 100)) + 1;
 const titleOfLevel = lv => XP_TITLES.filter(t => lv >= t[0]).pop()[1];
 
+// ---------------------------------------------------------------------------
+// THANKSGIVING EVENT (all times are US Pacific; set EVENT_OFF=1 on Render to switch it off).
+//  - levels tagged "thanksgiving" are the feast levels: beat one = Feast Starter badge, beat them all (3+) = Full Banquet badge
+//  - play on 3 different days = Thankful badge + the Harvest profile frame
+//  - beat any level without losing a heart = Gratitude badge
+//  - ranked wins give DOUBLE RP Friday-Sunday
+// Badges are kept forever (users.event_badges); the event only controls when they can be earned.
+// ---------------------------------------------------------------------------
+const EVENT = { id: "thanksgiving2026", tag: "thanksgiving", start: Date.UTC(2026, 10, 20, 8), end: Date.UTC(2026, 11, 5, 8), doubleStart: Date.UTC(2026, 10, 27, 8), doubleEnd: Date.UTC(2026, 10, 30, 8) };
+const eventOn = () => !process.env.EVENT_OFF && Date.now() >= EVENT.start && Date.now() < EVENT.end;
+const doubleRpOn = () => eventOn() && Date.now() >= EVENT.doubleStart && Date.now() < EVENT.doubleEnd;
+const eventInfo = () => ({ id: EVENT.id, active: eventOn(), endsAt: EVENT.end, doubleRp: doubleRpOn(), doubleEndsAt: EVENT.doubleEnd, tag: EVENT.tag });
+const eventDayKey = () => new Date(Date.now() - 8 * 3600 * 1000).toISOString().slice(0, 10);
+async function awardBadge(userId, id) {   // true only the first time
+    try { const r = await pool.query("UPDATE users SET event_badges = array_append(event_badges, $2) WHERE id = $1 AND NOT ($2 = ANY(event_badges)) RETURNING id", [userId, id]); return r.rows.length > 0; }
+    catch (e) { console.error("badge", e.message); return false; }
+}
+async function touchEventDay(userId) {   // a visit on a new event day counts toward the 3-day Thankful badge
+    if (!eventOn()) return;
+    try {
+        const r = await pool.query("UPDATE users SET event_days = array_append(event_days, $2) WHERE id = $1 AND NOT ($2 = ANY(event_days)) RETURNING cardinality(event_days) AS n", [userId, eventDayKey()]);
+        if (r.rows.length && r.rows[0].n >= 3) await awardBadge(userId, "tg_thankful");
+    } catch (e) { console.error("event day", e.message); }
+}
+
 const ACHIEVEMENTS = [
     ["first_clear", u => u.games_completed >= 1], ["rated_clear", u => u.stars >= 1], ["insane", u => u.hardest_rank >= 5], ["extreme", u => u.hardest_rank >= 6],
     ["notes_1k", u => Number(u.total_notes_hit) >= 1000], ["notes_10k", u => Number(u.total_notes_hit) >= 10000],
@@ -409,7 +509,7 @@ const ACHIEVEMENTS = [
 const COSMETICS = {
     tile:  { default: () => true, ice: u => u.stars >= 5, gold: u => u.stars >= 25, neon: u => u.extreme_points >= 100, royal: u => u.creator_points >= 1 },
     fx:    { default: () => true, sparkle: u => u.stars >= 10, fire: u => u.extreme_points >= 250, confetti: u => u.battle_wins >= 5 },
-    frame: { none: () => true, bronze: u => u.level >= 5, silver: u => u.level >= 15, gold: u => u.level >= 30, creator: u => u.creator_points >= 1, list: u => u.list_beaten >= 1 }
+    frame: { none: () => true, bronze: u => u.level >= 5, silver: u => u.level >= 15, gold: u => u.level >= 30, creator: u => u.creator_points >= 1, list: u => u.list_beaten >= 1, harvest: u => (u.event_badges || []).includes("tg_thankful") }
 };
 function cosmeticState(u) {
     const unlocked = {}, equipped = {};
@@ -444,7 +544,8 @@ function publicUser(user, includeEmail = true) {
         elo: user.elo || 1000,
         rankedRp: user.rank_rp || 0, rank: rankInfo(user.rank_rp), rankedWins: user.ranked_wins || 0, rankedLosses: user.ranked_losses || 0,
         cosmetics: cos.equipped,
-        achievements: ACHIEVEMENTS.filter(([, f]) => f(u)).map(([id]) => id),
+        turkey: (user.event_badges || []).includes("tg_banquet"),
+        achievements: ACHIEVEMENTS.filter(([, f]) => f(u)).map(([id]) => id).concat(user.event_badges || []),
         statistics: {
             gamesPlayed: user.games_played,
             gamesCompleted: user.games_completed,
@@ -576,7 +677,7 @@ function sanitizeNotes(data) {
     return out;
 }
 
-const ALLOWED_TAGS = ["speed", "chords", "holds", "memory", "tech", "long", "short", "jumps", "streams", "strict", "beginner"];
+const ALLOWED_TAGS = ["thanksgiving", "speed", "chords", "holds", "memory", "tech", "long", "short", "jumps", "streams", "strict", "beginner"];
 
 function sanitizeEffects(effects) {
     if (!Array.isArray(effects)) return [];
@@ -642,7 +743,7 @@ function sanitizeLevel(body) {
     if (level.hideHitboxes) meta.hideHitboxes = true;
     if (level.showLetters) meta.showLetters = true;
     if (Array.isArray(level.startPositions)) meta.startPositions = [...new Set(level.startPositions.map(Number).filter(n => Number.isFinite(n) && n >= 0 && n <= 3600).map(n => Math.round(n * 1000) / 1000))].sort((a, b) => a - b).slice(0, 20);
-    if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
+    if (Array.isArray(level.tags)) meta.tags = level.tags.map(t => String(t).toLowerCase()).filter((t, i, a) => t !== "thanksgiving" && ALLOWED_TAGS.includes(t) && a.indexOf(t) === i).slice(0, 5);
     if (typeof level.description === "string" && level.description.trim()) meta.description = level.description.trim().slice(0, 400);
     if (typeof level.thumb === "string" && /^data:image\/(jpeg|png|webp);base64,/.test(level.thumb) && level.thumb.length <= 60000) meta.thumb = level.thumb;
     if (Number.isInteger(Number(level.songId)) && Number(level.songId) > 0) meta.songId = Number(level.songId);
@@ -769,7 +870,8 @@ app.post("/api/auth/login", rateLimit("login", 40, 15 * 60 * 1000, "failure"), a
         if (!(await bcrypt.compare(password, row.password_hash))) return res.status(401).json({ success: false, message: "Invalid username/email or password" });
         if (isBanned(row)) return res.status(403).json(banPayload({ until: row.banned_until, reason: row.ban_reason || "" }));
         const user = await fetchUser(row.id);
-        res.json({ success: true, message: "Logged in successfully", token: createToken(user), user: publicUser(user) });
+        await touchEventDay(user.id);
+        res.json({ success: true, message: "Logged in successfully", token: createToken(user), user: publicUser(await fetchUser(user.id) || user) });
     } catch (error) {
         console.error("Login error:", error);
         res.status(500).json({ success: false, message: "Could not log in" });
@@ -778,6 +880,7 @@ app.post("/api/auth/login", rateLimit("login", 40, 15 * 60 * 1000, "failure"), a
 
 app.get("/api/auth/me", authenticate, async (req, res) => {
     try {
+        await touchEventDay(req.auth.userId);
         const user = await fetchUser(req.auth.userId);
         if (!user) return res.status(404).json({ success: false, message: "Account not found" });
         res.json({ success: true, user: publicUser(user) });
@@ -841,9 +944,9 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
     try {
         const me = req.auth.userId;
         const levelId = String(req.body.levelId || "");
-        let counted = false, dailyBonus = 0;
+        let counted = false, dailyBonus = 0; const newBadges = [];
         if (isUuid(levelId)) {
-            const lvl = await pool.query(`SELECT author_id, name, jsonb_array_length(level_data) AS notes,
+            const lvl = await pool.query(`SELECT author_id, name, meta, jsonb_array_length(level_data) AS notes,
                 COALESCE((SELECT MAX((e->>'time')::float) FROM jsonb_array_elements(level_data) e), 0) AS last_time FROM levels WHERE id = $1`, [levelId]);
             const row = lvl.rows[0];
             counted = !!row && row.author_id !== me && !req.auth.imp;   // viewing-as-player sessions never earn stats
@@ -905,6 +1008,16 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
                                 if (wc.rows.length) await pool.query("UPDATE users SET bonus_stars = bonus_stars + $2 WHERE id = $1", [me, appSettings.weeklyBonusStars]);
                             }
                         } catch (e) { console.error("weekly claim", e.message); }
+                        if (eventOn()) {   // Thanksgiving badges
+                            try {
+                                if ((((row.meta || {}).tags) || []).includes(EVENT.tag)) {
+                                    if (await awardBadge(me, "tg_feast")) newBadges.push("tg_feast");
+                                    const q = await pool.query(`SELECT COUNT(*)::int AS total, COUNT(c.level_id)::int AS done FROM levels l LEFT JOIN level_completions c ON c.level_id = l.id AND c.user_id = $1 WHERE l.meta->'tags' @> to_jsonb($2::text)`, [me, EVENT.tag]);
+                                    if (q.rows[0].total >= 3 && q.rows[0].done >= q.rows[0].total && await awardBadge(me, "tg_banquet")) newBadges.push("tg_banquet");
+                                }
+                                if (req.body.flawless === true && await awardBadge(me, "tg_gratitude")) newBadges.push("tg_gratitude");
+                            } catch (e) { console.error("event badges", e.message); }
+                        }
                         const daily = await getDailyLevelRow();
                         if (daily && daily.id === levelId) {
                             const claim = await pool.query("INSERT INTO daily_claims (user_id, day, level_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING day", [me, todayKey(), levelId]);
@@ -914,7 +1027,7 @@ app.post("/api/stats/game", authenticate, async (req, res) => {
                 }
             }
         }
-        res.json({ success: true, counted, dailyBonus, user: publicUser(await fetchUser(me)) });
+        res.json({ success: true, counted, dailyBonus, newBadges, user: publicUser(await fetchUser(me)) });
     } catch (error) {
         console.error("Game stats update error:", error);
         res.status(500).json({ success: false, message: "Could not update game statistics" });
@@ -932,10 +1045,10 @@ app.get("/api/levels/:id/leaderboard", async (req, res) => {
     try {
         if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: "Level not found" });
         const r = await pool.query(
-            `SELECT u.username, u.profile_icon, u.cosmetics, r.best_pct, r.best_score, r.completed, EXISTS (SELECT 1 FROM replays p WHERE p.user_id = r.user_id AND p.level_id = r.level_id) AS has_replay FROM level_records r JOIN users u ON u.id = r.user_id
+            `SELECT u.username, u.profile_icon, u.cosmetics, ('tg_banquet' = ANY(u.event_badges)) AS turkey, r.best_pct, r.best_score, r.completed, EXISTS (SELECT 1 FROM replays p WHERE p.user_id = r.user_id AND p.level_id = r.level_id) AS has_replay FROM level_records r JOIN users u ON u.id = r.user_id
              WHERE r.level_id = $1 AND (u.banned_until IS NULL OR u.banned_until < NOW())
              ORDER BY r.completed DESC, r.best_pct DESC, r.best_score DESC LIMIT 25`, [req.params.id]);
-        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.best_pct, score: Number(x.best_score), completed: x.completed, hasReplay: x.has_replay })) });
+        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey, pct: x.best_pct, score: Number(x.best_score), completed: x.completed, hasReplay: x.has_replay })) });
     } catch (error) { res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
 });
 
@@ -1097,13 +1210,13 @@ app.get("/api/friends", authenticate, async (req, res) => {
     try {
         const me = req.auth.userId;
         const r = await pool.query(
-            `SELECT f.user_id, f.friend_id, f.status, u.id AS other_id, u.username, u.profile_icon, u.cosmetics
+            `SELECT f.user_id, f.friend_id, f.status, u.id AS other_id, u.username, u.profile_icon, u.cosmetics, ('tg_banquet' = ANY(u.event_badges)) AS turkey
              FROM friendships f JOIN users u ON u.id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END
              WHERE f.user_id = $1 OR f.friend_id = $1`, [me]);
         const online = new Map([...lobby.values()].filter(s => s.data.userId).map(s => [s.data.userId, s]));
         res.json({ success: true, friends: r.rows.map(x => {
             const sock = online.get(x.other_id);
-            return { userId: x.other_id, username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none",
+            return { userId: x.other_id, username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey,
                 state: x.status === "accepted" ? "friend" : (x.user_id === me ? "outgoing" : "incoming"),
                 online: !!sock, status: sock ? sock.data.status : "offline", socketId: sock ? sock.id : null };
         }) });
@@ -2024,7 +2137,7 @@ app.get("/api/admin/players/:id/completions", requireAdmin, async (req, res) => 
 });
 
 // --- public settings + username change ---
-app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: (bwMode() === "normal" ? "" : BW_MSG[bwMode()] + (appSettings.announcement ? " " : "")) + appSettings.announcement, dataMode: bwMode(), dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen, listMaxPoints: appSettings.listMaxPoints }));
+app.get("/api/settings", (req, res) => res.json({ success: true, maxBpm: appSettings.maxBpm, announcement: (bwMode() === "normal" ? "" : BW_MSG[bwMode()] + (appSettings.announcement ? " " : "")) + appSettings.announcement, dataMode: bwMode(), dailyBonusStars: appSettings.dailyBonusStars, commentsOpen: appSettings.commentsOpen, registrationOpen: appSettings.registrationOpen, listMaxPoints: appSettings.listMaxPoints, event: eventInfo() }));
 
 app.patch("/api/profile/username", authenticate, async (req, res) => {
     try {
@@ -3019,7 +3132,8 @@ async function applyRankedResult(m, winner, loser) {
         const w = r.rows.find(x => x.id === winner.userId), l = r.rows.find(x => x.id === loser.userId);
         if (!w || !l) return null;
         const exp = 1 / (1 + Math.pow(10, (l.rank_rp - w.rank_rp) / 400));
-        const delta = Math.max(8, Math.min(38, Math.round(40 * (1 - exp))));
+        const bonus = doubleRpOn() ? 2 : 1;   // Thanksgiving weekend: wins are worth double (losses are unchanged)
+        const delta = Math.max(8, Math.min(38, Math.round(40 * (1 - exp)))) * bonus;
         const nw = (await pool.query("UPDATE users SET rank_rp = rank_rp + $2, ranked_wins = ranked_wins + 1, battle_wins = battle_wins + 1 WHERE id = $1 RETURNING rank_rp", [w.id, delta])).rows[0].rank_rp;
         const nl = (await pool.query("UPDATE users SET rank_rp = GREATEST(0, rank_rp - $2), ranked_losses = ranked_losses + 1, battle_losses = battle_losses + 1 WHERE id = $1 RETURNING rank_rp", [l.id, delta])).rows[0].rank_rp;
         return { [w.id]: { before: w.rank_rp, after: nw }, [l.id]: { before: l.rank_rp, after: nl } };
@@ -3757,12 +3871,12 @@ app.get("/api/challenges/:kind/leaderboard", async (req, res) => {
         const per = req.params.kind === "weekly" ? "w" : req.params.kind === "daily" ? "d" : null;
         if (!per) return res.status(404).json({ success: false });
         const key = per === "w" ? weekStartKey() : todayKey(), me = optionalUserId(req);
-        const r = await pool.query(`SELECT * FROM (SELECT c.user_id, u.username, u.profile_icon, u.cosmetics, c.pct, c.score, c.completed,
+        const r = await pool.query(`SELECT * FROM (SELECT c.user_id, u.username, u.profile_icon, u.cosmetics, ('tg_banquet' = ANY(u.event_badges)) AS turkey, c.pct, c.score, c.completed,
                 RANK() OVER (ORDER BY c.completed DESC, c.pct DESC, c.score DESC) AS rank
             FROM challenge_scores c JOIN users u ON u.id = c.user_id WHERE c.period = $1 AND c.period_key = $2 AND (u.banned_until IS NULL OR u.banned_until < NOW())) x ORDER BY rank, score DESC LIMIT 25`, [per, key]);
         let mine = null;
         if (me) { const m = await pool.query(`SELECT * FROM (SELECT c.user_id, c.pct, c.score, c.completed, RANK() OVER (ORDER BY c.completed DESC, c.pct DESC, c.score DESC) AS rank FROM challenge_scores c WHERE c.period = $1 AND c.period_key = $2) x WHERE user_id = $3`, [per, key, me]); if (m.rows[0]) mine = { rank: Number(m.rows[0].rank), pct: m.rows[0].pct, score: m.rows[0].score, completed: m.rows[0].completed }; }
-        res.json({ success: true, entries: r.rows.map(x => ({ rank: Number(x.rank), username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", pct: x.pct, score: x.score, completed: x.completed, me: x.user_id === me })), mine });
+        res.json({ success: true, entries: r.rows.map(x => ({ rank: Number(x.rank), username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey, pct: x.pct, score: x.score, completed: x.completed, me: x.user_id === me })), mine });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
 });
 app.post("/api/admin/weekly", requireAdmin, async (req, res) => {
@@ -4055,6 +4169,7 @@ async function startServer() {
         await initializeDatabase();
         await bwLoad();
         await seedOfficialLevels();
+        await seedThanksgivingLevels();
         server.listen(PORT, () => {
             console.log(`06-Tiles Backend v3 running on port ${PORT}`);
             console.log("PostgreSQL database initialized; Socket.IO battle server ready");
