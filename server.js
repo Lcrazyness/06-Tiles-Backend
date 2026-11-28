@@ -453,7 +453,7 @@ const DIFF_RANK_SQL = "CASE l.difficulty WHEN 'Easy' THEN 1 WHEN 'Normal' THEN 2
 // creator points = how many of YOUR levels are rated.
 const USER_FULL = `u.id, u.username, u.email, u.profile_icon, u.created_at, u.games_played, u.games_completed,
     u.total_score, u.best_score, u.total_notes_hit, u.battle_wins, u.battle_losses, u.rank_rp, u.ranked_wins, u.ranked_losses,
-    u.banned_until, u.ban_reason, u.pending_warning, u.is_admin, u.muted_until,
+    u.banned_until, u.ban_reason, u.pending_warning, u.is_admin, u.muted_until, u.event_badges, u.event_days,
     (COALESCE((SELECT SUM(l.rated_stars) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.featured), 0) + u.bonus_stars)::int AS stars, u.elo, u.cosmetics, u.flags,
     ((SELECT COUNT(*) FROM levels l WHERE l.author_id = u.id AND l.featured) + u.bonus_creator)::int AS creator_points,
     (COALESCE((SELECT SUM(${LIST_POINTS_SQL}) FROM level_completions c JOIN levels l ON l.id = c.level_id WHERE c.user_id = u.id AND l.list_position IS NOT NULL), 0) + u.bonus_extreme)::int AS extreme_points,
@@ -490,8 +490,16 @@ async function awardBadge(userId, id) {   // true only the first time
     try { const r = await pool.query("UPDATE users SET event_badges = array_append(event_badges, $2) WHERE id = $1 AND NOT ($2 = ANY(event_badges)) RETURNING id", [userId, id]); return r.rows.length > 0; }
     catch (e) { console.error("badge", e.message); return false; }
 }
+async function syncEventBadges(userId) {   // re-checks the feast badges from the levels the player already beat (safe to run any time)
+    try {
+        const q = await pool.query(`SELECT COUNT(*)::int AS total, COUNT(c.level_id)::int AS done FROM levels l LEFT JOIN level_completions c ON c.level_id = l.id AND c.user_id = $1 WHERE l.meta->'tags' @> to_jsonb($2::text)`, [userId, EVENT.tag]);
+        if (q.rows[0].done >= 1) await awardBadge(userId, "tg_feast");
+        if (q.rows[0].total >= 3 && q.rows[0].done >= q.rows[0].total) await awardBadge(userId, "tg_banquet");
+    } catch (e) { console.error("sync badges", e.message); }
+}
 async function touchEventDay(userId) {   // a visit on a new event day counts toward the 3-day Thankful badge
     if (!eventOn()) return;
+    await syncEventBadges(userId);
     try {
         const r = await pool.query("UPDATE users SET event_days = array_append(event_days, $2) WHERE id = $1 AND NOT ($2 = ANY(event_days)) RETURNING cardinality(event_days) AS n", [userId, eventDayKey()]);
         if (r.rows.length && r.rows[0].n >= 3) await awardBadge(userId, "tg_thankful");
@@ -509,14 +517,17 @@ const ACHIEVEMENTS = [
 const COSMETICS = {
     tile:  { default: () => true, ice: u => u.stars >= 5, gold: u => u.stars >= 25, neon: u => u.extreme_points >= 100, royal: u => u.creator_points >= 1 },
     fx:    { default: () => true, sparkle: u => u.stars >= 10, fire: u => u.extreme_points >= 250, confetti: u => u.battle_wins >= 5 },
-    frame: { none: () => true, bronze: u => u.level >= 5, silver: u => u.level >= 15, gold: u => u.level >= 30, creator: u => u.creator_points >= 1, list: u => u.list_beaten >= 1, harvest: u => (u.event_badges || []).includes("tg_thankful") }
+    frame: { none: () => true, bronze: u => u.level >= 5, silver: u => u.level >= 15, gold: u => u.level >= 30, creator: u => u.creator_points >= 1, list: u => u.list_beaten >= 1, harvest: u => (u.event_badges || []).includes("tg_thankful") },
+    // side buddy: a little companion shown next to your profile picture. "none" is always allowed; new buddies just get added here.
+    buddy: { none: () => true, turkey: u => (u.event_badges || []).includes("tg_banquet") }
 };
+const buddyOf = (cosmetics, turkeyUnlocked) => { const w = (cosmetics || {}).buddy; return turkeyUnlocked && (w === undefined || w === "turkey") ? "turkey" : "none"; };   // for rows that only know the stored choice
 function cosmeticState(u) {
     const unlocked = {}, equipped = {};
     for (const kind of Object.keys(COSMETICS)) {
         unlocked[kind] = Object.keys(COSMETICS[kind]).filter(id => COSMETICS[kind][id](u));
         const want = (u.cosmetics || {})[kind];
-        equipped[kind] = unlocked[kind].includes(want) ? want : Object.keys(COSMETICS[kind])[0];
+        equipped[kind] = unlocked[kind].includes(want) ? want : (kind === "buddy" && want === undefined ? (unlocked[kind].filter(x => x !== "none").pop() || "none") : Object.keys(COSMETICS[kind])[0]);   // a new buddy is worn automatically until you choose "none"
     }
     return { unlocked, equipped };
 }
@@ -544,7 +555,7 @@ function publicUser(user, includeEmail = true) {
         elo: user.elo || 1000,
         rankedRp: user.rank_rp || 0, rank: rankInfo(user.rank_rp), rankedWins: user.ranked_wins || 0, rankedLosses: user.ranked_losses || 0,
         cosmetics: cos.equipped,
-        turkey: (user.event_badges || []).includes("tg_banquet"),
+        buddy: cos.equipped.buddy,
         achievements: ACHIEVEMENTS.filter(([, f]) => f(u)).map(([id]) => id).concat(user.event_badges || []),
         statistics: {
             gamesPlayed: user.games_played,
@@ -1048,7 +1059,7 @@ app.get("/api/levels/:id/leaderboard", async (req, res) => {
             `SELECT u.username, u.profile_icon, u.cosmetics, ('tg_banquet' = ANY(u.event_badges)) AS turkey, r.best_pct, r.best_score, r.completed, EXISTS (SELECT 1 FROM replays p WHERE p.user_id = r.user_id AND p.level_id = r.level_id) AS has_replay FROM level_records r JOIN users u ON u.id = r.user_id
              WHERE r.level_id = $1 AND (u.banned_until IS NULL OR u.banned_until < NOW())
              ORDER BY r.completed DESC, r.best_pct DESC, r.best_score DESC LIMIT 25`, [req.params.id]);
-        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey, pct: x.best_pct, score: Number(x.best_score), completed: x.completed, hasReplay: x.has_replay })) });
+        res.json({ success: true, entries: r.rows.map(x => ({ username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", buddy: buddyOf(x.cosmetics, x.turkey), pct: x.best_pct, score: Number(x.best_score), completed: x.completed, hasReplay: x.has_replay })) });
     } catch (error) { res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
 });
 
@@ -1216,7 +1227,7 @@ app.get("/api/friends", authenticate, async (req, res) => {
         const online = new Map([...lobby.values()].filter(s => s.data.userId).map(s => [s.data.userId, s]));
         res.json({ success: true, friends: r.rows.map(x => {
             const sock = online.get(x.other_id);
-            return { userId: x.other_id, username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey,
+            return { userId: x.other_id, username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", buddy: buddyOf(x.cosmetics, x.turkey),
                 state: x.status === "accepted" ? "friend" : (x.user_id === me ? "outgoing" : "incoming"),
                 online: !!sock, status: sock ? sock.data.status : "offline", socketId: sock ? sock.id : null };
         }) });
@@ -3885,7 +3896,7 @@ app.get("/api/challenges/:kind/leaderboard", async (req, res) => {
             FROM challenge_scores c JOIN users u ON u.id = c.user_id WHERE c.period = $1 AND c.period_key = $2 AND (u.banned_until IS NULL OR u.banned_until < NOW())) x ORDER BY rank, score DESC LIMIT 25`, [per, key]);
         let mine = null;
         if (me) { const m = await pool.query(`SELECT * FROM (SELECT c.user_id, c.pct, c.score, c.completed, RANK() OVER (ORDER BY c.completed DESC, c.pct DESC, c.score DESC) AS rank FROM challenge_scores c WHERE c.period = $1 AND c.period_key = $2) x WHERE user_id = $3`, [per, key, me]); if (m.rows[0]) mine = { rank: Number(m.rows[0].rank), pct: m.rows[0].pct, score: m.rows[0].score, completed: m.rows[0].completed }; }
-        res.json({ success: true, entries: r.rows.map(x => ({ rank: Number(x.rank), username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", turkey: !!x.turkey, pct: x.pct, score: x.score, completed: x.completed, me: x.user_id === me })), mine });
+        res.json({ success: true, entries: r.rows.map(x => ({ rank: Number(x.rank), username: x.username, profileIcon: x.profile_icon, frame: (x.cosmetics || {}).frame || "none", buddy: buddyOf(x.cosmetics, x.turkey), pct: x.pct, score: x.score, completed: x.completed, me: x.user_id === me })), mine });
     } catch (e) { console.error(e); res.status(500).json({ success: false, message: "Could not load the leaderboard" }); }
 });
 app.post("/api/admin/weekly", requireAdmin, async (req, res) => {
